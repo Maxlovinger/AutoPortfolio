@@ -1,6 +1,14 @@
 """
 paper_trader.py — forward paper-trading validation loop.
 
+>>> DEPRECATED STRATEGY PATH <<<
+    target_weights() / run_once() / main() here run the OLD research strategy
+    (score_combined top-N max-Sharpe) and are kept only for reference. The LIVE
+    system is now auto_rebalance.py, which runs the LOCKED strategy (liquid-30,
+    equal-weight, quarterly, weekly-banded vol-target). This file is retained
+    because auto_rebalance REUSES its still-current, tested infrastructure:
+    SimBroker, IBKRBroker, and plan_orders(). Do not start new work from main().
+
 WHY THIS EXISTS
 ---------------
 A historical backtest on today's constituents suffers survivorship bias. Forward

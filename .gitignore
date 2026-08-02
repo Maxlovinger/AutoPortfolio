@@ -9,6 +9,12 @@ __pycache__/
 paper_state.json
 paper_track_record.csv
 ibkr_track_record.csv
+auto_state.json
+decision_log.md
+decision_log.jsonl
+auto_run.log
+launchd.out.log
+launchd.err.log
 
 # OS
 .DS_Store

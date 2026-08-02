@@ -71,6 +71,22 @@ def test_cppi_controls_drawdown(rets):
     assert dd > raw_dd                            # shallower than un-overlaid
 
 
+def test_banded_exposure_reduces_turnover(rets):
+    # a jittery target should trade far less under a band than continuously
+    target = pd.Series(np.random.default_rng(2).uniform(0.4, 1.0, len(rets)),
+                       index=rets.index)
+    banded = em.banded_exposure(target, band=0.10, check_every=5)
+    assert banded.diff().abs().sum() < target.diff().abs().sum()
+
+
+def test_banded_exposure_holds_within_band():
+    # target drifts by less than the band -> exposure never moves
+    target = pd.Series([1.0, 0.96, 0.93, 0.95, 1.0],
+                       index=pd.date_range("2020-01-01", periods=5, freq="B"))
+    banded = em.banded_exposure(target, band=0.10, check_every=1)
+    assert (banded == 1.0).all()
+
+
 def test_vix_breaker_only_cuts_above_threshold(rets):
     vix = pd.Series(0.15, index=rets.index)
     vix.iloc[100:110] = 0.50                       # a spike

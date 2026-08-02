@@ -31,6 +31,8 @@ LOG_MD = "decision_log.md"
 LOG_JSONL = "decision_log.jsonl"
 
 # ---- LOCKED PARAMETERS (mirror final_strategy.py) ----
+TRADE_CAPITAL = 40_000.0     # $ to actually deploy (rest of the account stays cash);
+                             # set to None to use the full account NAV.
 BASKET_N = 30
 MAX_PER_SECTOR = 5
 TARGET_VOL = 0.15
@@ -142,7 +144,7 @@ def log_decision(record: dict, rationale_lines: list[str]):
 # ----------------------------------------------------------------------
 # The scheduled run
 # ----------------------------------------------------------------------
-def run(kind="sim", dry_run=True, port=7497, today=None, verbose=True):
+def run(kind="sim", dry_run=True, port=7497, today=None, verbose=True, moo=False):
     from data import download_prices
     from sector_select import load_sectors
     from costs import load_adv
@@ -199,18 +201,45 @@ def run(kind="sim", dry_run=True, port=7497, today=None, verbose=True):
     # ---- route orders ----
     broker = make_broker(kind, dry_run=dry_run, port=port)
     try:
+        nav = broker.nav(latest) if kind != "ibkr" else broker.nav()
+        # deploy only TRADE_CAPITAL (rest of the account stays in cash)
+        if TRADE_CAPITAL and nav > 0:
+            budget = min(TRADE_CAPITAL, nav)
+            weights = weights * (budget / nav)
+            rationale.append(f"Deploying ${budget:,.0f} of ${nav:,.0f} account "
+                             f"(TRADE_CAPITAL cap); rest stays cash.")
         if kind == "ibkr":
-            nav = broker.nav()
+            import time
             from paper_trader import plan_orders as _po
             current = {k: int(v) for k, v in broker._ibkr.positions(broker.app).items()}
             orders = _po(weights, latest, nav, current)
-            for o in orders:
-                if not dry_run:
+            if not dry_run:
+                order_builder = (broker._ibkr.market_on_open_order if moo
+                                 else broker._ibkr.market_order)
+                for o in orders:
                     oid = broker.app.next_order_id()
                     broker.app.placeOrder(oid, broker._ibkr.stock(o["ticker"]),
-                                          broker._ibkr.market_order(o["action"],
-                                                                    abs(o["shares"])))
+                                          order_builder(o["action"],
+                                                        abs(o["shares"])))
                     o["order_id"] = oid
+                # WAIT for TWS to acknowledge before disconnecting (else the async
+                # orders can be dropped when the socket closes). Poll orderStatus.
+                oids = [o["order_id"] for o in orders]
+                deadline = time.time() + 25
+                while time.time() < deadline and not all(
+                        oid in broker.app.order_status for oid in oids):
+                    time.sleep(0.5)
+                for o in orders:
+                    stt = broker.app.order_status.get(o["order_id"])
+                    o["status"] = stt["status"] if stt else "UNCONFIRMED"
+                acks = sum(1 for o in orders if o.get("status") != "UNCONFIRMED")
+                errs = [f"{c}: {t}" for lvl, c, t in broker.app.messages
+                        if lvl == "error"]
+                rationale.append(f"Transmitted {len(orders)} orders; {acks} "
+                                 f"acknowledged by TWS.")
+                if errs:
+                    rationale.append("TWS errors: " + "; ".join(errs[:6]))
+                time.sleep(1.0)          # final flush before disconnect
         else:
             trades = broker.rebalance(weights, latest)
             nav = broker.snapshot(latest)
@@ -250,7 +279,8 @@ def main():
     kind = "ibkr" if "--ibkr" in sys.argv else "sim"
     dry_run = "--live" not in sys.argv
     port = 4002 if "--gateway" in sys.argv else 7497
-    run(kind=kind, dry_run=dry_run, port=port)
+    moo = "--moo" in sys.argv          # Market-on-Open: stage orders for next open
+    run(kind=kind, dry_run=dry_run, port=port, moo=moo)
     print("\nUsage: python3 auto_rebalance.py [--ibkr] [--live] [--gateway]")
     print("  default = SimBroker dry-run. --ibkr routes to TWS. --live transmits.")
 

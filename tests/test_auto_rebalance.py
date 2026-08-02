@@ -49,13 +49,14 @@ def test_decide_exposure_missing_vol_holds():
 
 
 def test_select_book_respects_sector_cap():
-    adv = pd.Series({f"T{i}": 100 - i for i in range(20)})
-    sectors = {t: ("Tech" if i < 10 else "Health") for i, t in enumerate(adv.index)}
+    adv = pd.Series({f"T{i}": 100 - i for i in range(30)})
+    secs = ["Tech", "Health", "Financials"]
+    sectors = {t: secs[i % 3] for i, t in enumerate(adv.index)}
     valid = set(adv.index)
     picks = ar.select_book(adv, sectors, valid, n=8, cap=3)
     assert len(picks) == 8
-    tech = sum(1 for t in picks if sectors[t] == "Tech")
-    assert tech <= 3
+    for s in secs:
+        assert sum(1 for t in picks if sectors[t] == s) <= 3
 
 
 def test_select_book_skips_unpriced():

@@ -76,7 +76,9 @@ class IBKRClient(EWrapper, EClient):
 # ---------------------------------------------------------------- helpers
 def stock(symbol: str) -> Contract:
     c = Contract()
-    c.symbol = symbol
+    # IBKR uses a SPACE for share classes (BRK B, BF B), not the dash yfinance
+    # uses (BRK-B). Without this, class-share tickers fail security lookup.
+    c.symbol = symbol.replace("-", " ")
     c.secType = "STK"
     c.exchange = "SMART"
     c.currency = "USD"
@@ -92,6 +94,14 @@ def market_order(action: str, quantity: int) -> Order:
     for attr in ("eTradeOnly", "firmQuoteOnly"):
         if hasattr(o, attr):
             setattr(o, attr, False)
+    return o
+
+
+def market_on_open_order(action: str, quantity: int) -> Order:
+    """Market-on-Open: fills in the next opening auction. Can be staged while the
+    market is closed (unlike a plain MKT order, which gets cancelled off-hours)."""
+    o = market_order(action, quantity)
+    o.tif = "OPG"                     # 'at the opening'
     return o
 
 
