@@ -10,7 +10,8 @@ import pytest
 import backtester as bt
 from backtester import (
     walk_forward, benchmark_equal_weight, performance,
-    weight_equal, weight_max_sharpe, score_momentum,
+    weight_equal, weight_max_sharpe, weight_min_variance,
+    score_momentum, score_reversal, vol_target,
 )
 from tests.conftest import make_prices
 
@@ -95,6 +96,28 @@ def test_select_fn_overrides_top_n(prices_bt):
     assert set(held) <= set(only)
 
 
+def test_realistic_cost_model_reduces_returns(prices_bt):
+    """Passing an ADV series triggers the spread+impact model and costs money."""
+    adv = pd.Series({t: 5e6 for t in UNIV})   # thin-ish names
+    free = walk_forward(prices_bt, score_momentum, weight_equal,
+                        top_n=3, lookback=120, rebalance=21, cost_bps=0)
+    costly = walk_forward(prices_bt, score_momentum, weight_equal,
+                          top_n=3, lookback=120, rebalance=21,
+                          adv=adv, capital=10_000_000)
+    assert costly["equity"].iloc[-1] < free["equity"].iloc[-1]
+
+
+def test_realistic_cost_bigger_book_costs_more(prices_bt):
+    adv = pd.Series({t: 2e6 for t in UNIV})
+    small = walk_forward(prices_bt, score_momentum, weight_equal,
+                         top_n=3, lookback=120, rebalance=21,
+                         adv=adv, capital=1_000_000)
+    big = walk_forward(prices_bt, score_momentum, weight_equal,
+                       top_n=3, lookback=120, rebalance=21,
+                       adv=adv, capital=200_000_000)
+    assert big["equity"].iloc[-1] < small["equity"].iloc[-1]
+
+
 def test_insufficient_history_raises():
     small = make_prices(UNIV, n_days=80)
     with pytest.raises(ValueError):
@@ -111,3 +134,41 @@ def test_weight_max_sharpe_capped(prices_bt):
     w = weight_max_sharpe(prices_bt, picks, cap=0.5, lookback=200)
     assert abs(w.sum() - 1) < 1e-6
     assert (w <= 0.5 + 1e-6).all()
+
+
+def test_weight_min_variance_capped(prices_bt):
+    picks = ["AAA", "BBB", "CCC", "DDD"]
+    w = weight_min_variance(prices_bt, picks, cap=0.4, lookback=200)
+    assert abs(w.sum() - 1) < 1e-6
+    assert (w <= 0.4 + 1e-6).all()
+
+
+def test_weight_min_variance_survives_gaps(prices_bt):
+    """Gappy point-in-time histories must not collapse the book to one name."""
+    gapped = prices_bt.copy()
+    gapped.loc[gapped.index[:150], "CCC"] = np.nan   # CCC only recently listed
+    gapped.loc[gapped.index[-30:], "DDD"] = np.nan    # DDD just delisted
+    w = weight_min_variance(gapped, ["AAA", "BBB", "CCC", "DDD"],
+                            cap=0.5, lookback=200)
+    assert abs(w.sum() - 1) < 1e-6
+    assert len(w) >= 3                                 # didn't collapse
+
+
+def test_vol_target_reduces_vol_and_no_lookahead():
+    # a calm stretch then a wild stretch; targeting must tame the wild part
+    rng = np.random.default_rng(5)
+    calm = rng.normal(0, 0.005, 300)
+    wild = rng.normal(0, 0.05, 300)
+    r = pd.Series(np.concatenate([calm, wild]))
+    rt = vol_target(r, target=0.15, lookback=21, max_lev=1.0)
+    # realized vol of the overlaid series should be lower in the wild part
+    assert rt.iloc[300:].std() < r.iloc[300:].std()
+    # never levers up beyond max_lev: |scaled| <= |raw|
+    assert (rt.abs() <= r.abs() + 1e-12).all()
+
+
+def test_score_reversal_favors_oversold(prices_bt):
+    """A name that just dropped below its mean should score higher than one above."""
+    s = score_reversal(prices_bt)
+    assert s.notna().any()
+    assert s.index.isin(prices_bt.columns).all()

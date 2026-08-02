@@ -38,7 +38,7 @@ TRADING_DAYS = 252
 # ----------------------------------------------------------------------
 def walk_forward(prices: pd.DataFrame, score_fn, weight_fn, *,
                  top_n=8, lookback=504, rebalance=21, cost_bps=10.0,
-                 select_fn=None):
+                 select_fn=None, adv=None, capital=1_000_000.0):
     """
     Returns a dict with the daily equity curve, the weights history, the
     per-rebalance turnover, and the daily portfolio returns.
@@ -46,10 +46,14 @@ def walk_forward(prices: pd.DataFrame, score_fn, weight_fn, *,
     prices     : daily adjusted-close panel (dates x tickers)
     lookback   : trailing window (days) handed to the strategy each rebalance
     rebalance  : hold period in trading days between rebalances (21 ~ monthly)
-    cost_bps   : one-way transaction cost in basis points applied to turnover
+    cost_bps   : flat one-way cost (bps) applied to turnover when `adv` is None
+    adv        : optional pd.Series of dollar ADV per ticker. When provided, the
+                 realistic per-name spread+impact model (costs.py) is used
+                 instead of the flat cost_bps, scaled by `capital`.
+    capital    : assumed portfolio NAV in dollars (sets market-impact scale)
     """
     prices = prices.sort_index()
-    daily_ret = prices.pct_change()
+    daily_ret = prices.pct_change(fill_method=None)
     dates = prices.index
 
     # rebalance dates: after the warmup, every `rebalance` days
@@ -80,7 +84,14 @@ def walk_forward(prices: pd.DataFrame, score_fn, weight_fn, *,
     # transaction costs charged on rebalance turnover
     turnover = W.diff().abs().sum(axis=1)
     turnover.iloc[0] = W.iloc[0].abs().sum()      # initial buy-in
-    cost = turnover * (cost_bps / 1e4)
+    if adv is not None:
+        from costs import rebalance_cost
+        dW = W.diff()
+        dW.iloc[0] = W.iloc[0]                      # initial buy-in is all change
+        cost = pd.Series({t: rebalance_cost(dW.loc[t], adv, capital)
+                          for t in W.index})
+    else:
+        cost = turnover * (cost_bps / 1e4)
     port_ret.loc[cost.index] -= cost.values
 
     port_ret = port_ret.iloc[lookback:].fillna(0.0)
@@ -89,9 +100,19 @@ def walk_forward(prices: pd.DataFrame, score_fn, weight_fn, *,
             "turnover": turnover}
 
 
+def vol_target(returns: pd.Series, target=0.15, lookback=21, max_lev=1.0) -> pd.Series:
+    """Volatility-targeting overlay: scale each day's exposure toward a constant
+    annualized volatility, using only PAST realized vol (shifted, no look-ahead),
+    and never lever above `max_lev` (1.0 = long-only, de-risk into cash only).
+    Cuts drawdowns sharply by pulling risk down in turbulent periods."""
+    realized = returns.rolling(lookback).std() * np.sqrt(TRADING_DAYS)
+    scale = (target / realized).clip(upper=max_lev).shift(1).fillna(max_lev)
+    return returns * scale
+
+
 def benchmark_equal_weight(prices: pd.DataFrame, start_from=504):
     """Buy-and-hold equal weight of the whole universe (the thing to beat)."""
-    daily_ret = prices.pct_change()
+    daily_ret = prices.pct_change(fill_method=None)
     n = prices.shape[1]
     bench_ret = daily_ret.mean(axis=1).iloc[start_from:].fillna(0.0)
     return (1 + bench_ret).cumprod(), bench_ret
@@ -144,6 +165,38 @@ def weight_max_sharpe(window, picks, rf=0.04, cap=0.25, lookback=504):
 
 def weight_equal(window, picks):
     return pd.Series(1.0 / len(picks), index=picks)
+
+
+def weight_min_variance(window, picks, cap=0.15, lookback=252, min_obs=0.5):
+    """Capped minimum-variance weights on the trailing covariance of the picks.
+    The min-var portfolio is the trustworthy left-tip of the frontier — unlike
+    max-Sharpe it doesn't depend on fragile expected-return estimates.
+
+    Robust to gappy point-in-time histories: names are kept if they have at least
+    `min_obs` fraction of the window (so a newly-added or soon-delisted name isn't
+    dropped for a single gap), covariance is computed pairwise, and if too few
+    names qualify we fall back to equal weight rather than collapsing the book."""
+    from scipy.optimize import minimize
+    win = window[picks].tail(lookback)
+    good = [c for c in picks if win[c].notna().mean() >= min_obs]
+    if len(good) < 3:                    # too few to optimize -> equal weight
+        valid = [c for c in picks if pd.notna(window[c].iloc[-1])] or list(picks)
+        return pd.Series(1.0 / len(valid), index=valid)
+    rets = win[good].pct_change(fill_method=None)
+    Sig = (rets.cov().values) * TRADING_DAYS
+    n = len(good)
+    cap_eff = max(cap, 1.0 / n)          # keep the cap feasible for few names
+    res = minimize(lambda w: w @ Sig @ w, np.repeat(1 / n, n), method="SLSQP",
+                   bounds=[(0, cap_eff)] * n,
+                   constraints=[{"type": "eq", "fun": lambda w: w.sum() - 1}])
+    return pd.Series(res.x, index=good)
+
+
+def score_reversal(window, lookback=21):
+    """Short-term reversal: -(price / trailing-mean - 1). Higher = more oversold
+    (the strongest honest factor in our IC study)."""
+    rev = -(window / window.rolling(lookback).mean() - 1).iloc[-1]
+    return zscore(rev.dropna())
 
 
 def score_momentum(window):
