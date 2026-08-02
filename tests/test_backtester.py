@@ -84,6 +84,17 @@ def test_costs_reduce_returns(prices_bt):
     assert costly["equity"].iloc[-1] < free["equity"].iloc[-1]
 
 
+def test_select_fn_overrides_top_n(prices_bt):
+    """A custom select_fn should control which names are held each rebalance."""
+    only = ["AAA", "BBB"]
+    res = walk_forward(prices_bt, score_momentum, weight_equal,
+                       top_n=5, lookback=120, rebalance=21,
+                       select_fn=lambda s: only)
+    held = [c for c in res["weights"].columns
+            if (res["weights"][c] > 0).any()]
+    assert set(held) <= set(only)
+
+
 def test_insufficient_history_raises():
     small = make_prices(UNIV, n_days=80)
     with pytest.raises(ValueError):

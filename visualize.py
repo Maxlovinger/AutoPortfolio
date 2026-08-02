@@ -56,8 +56,8 @@ def plot_correlation_heatmap(prices: pd.DataFrame, path: str):
 # ----------------------------------------------------------------------
 # (A) Factors
 # ----------------------------------------------------------------------
-def plot_factor_scores(screen: pd.DataFrame, path: str):
-    cols = [c for c in ["value", "quality", "momentum", "value_x_mom"]
+def plot_factor_scores(screen: pd.DataFrame, path: str, cols=None):
+    cols = [c for c in (cols or ["value", "quality", "momentum", "value_x_mom"])
             if c in screen.columns]
     data = screen[cols]
     fig, ax = plt.subplots(figsize=(12, 6))
@@ -324,5 +324,123 @@ def make_all(outdir: str = FIGDIR):
     return paths
 
 
+def make_portfolio_charts(outdir="figures_sectorneutral",
+                          prices_pkl="prices_universe.pkl",
+                          top_n=15, max_per_sector=3, rf=0.04, cap=0.20):
+    """
+    Full chart set for the SECTOR-NEUTRAL universe portfolio, into `outdir`.
+    Reuses cached universe prices (no re-download) for everything except the
+    market-regime chart (SPY) and news sentiment (small live pull, best-effort).
+    """
+    import pandas as pd
+    from scipy.optimize import minimize
+    from data import returns_stats
+    from factor_analysis import factor_panels
+    from sector_select import load_sectors, sector_neutralize, select_sector_capped
+    from ml_rank import feature_importance
+    from markowitz import min_variance, sharpe_ratio
+    from regime import detect_regime, regime_probabilities, _market_returns
+    from backtester import walk_forward, benchmark_equal_weight, weight_max_sharpe
+    from utils import zscore
+
+    os.makedirs(outdir, exist_ok=True)
+    prices_all = pd.read_pickle(prices_pkl).dropna(how="all")
+    sectors = load_sectors()
+    paths = []
+
+    # --- build the sector-neutral portfolio ---
+    panels = factor_panels(prices_all)
+    mom = zscore(panels["momentum_12_1"].iloc[-1].dropna())
+    rev = zscore(panels["reversal"].iloc[-1].dropna())
+    raw = zscore(mom.add(rev, fill_value=0))
+    neutral = sector_neutralize(raw, sectors)
+    picks = select_sector_capped(neutral, sectors, top_n, max_per_sector)
+    pp = prices_all[picks].dropna()
+
+    def add(fn, name):
+        try:
+            paths.append(fn());
+        except Exception as e:
+            print(f"  (skipped {name}: {type(e).__name__}: {e})")
+
+    # 01-02 prices & correlation of the picks
+    add(lambda: plot_price_history(pp, f"{outdir}/01_prices.png"), "prices")
+    add(lambda: plot_correlation_heatmap(pp, f"{outdir}/02_correlation.png"), "correlation")
+
+    # 03 price-based factor scores for the picks
+    ftab = pd.DataFrame({
+        "momentum": mom.reindex(picks),
+        "reversal": rev.reindex(picks),
+        "low_vol":  zscore(panels["low_vol_63"].iloc[-1]).reindex(picks),
+        "dist_high": zscore(panels["dist_high"].iloc[-1]).reindex(picks),
+    }).fillna(0.0)
+    add(lambda: plot_factor_scores(ftab, f"{outdir}/03_factor_scores.png",
+                                   cols=["momentum", "reversal", "low_vol", "dist_high"]),
+        "factor scores")
+
+    # 04 sentiment (best-effort live news)
+    def _sent():
+        from sentiment import sentiment_scores
+        return plot_sentiment(sentiment_scores(picks).reindex(picks).fillna(0.0),
+                              f"{outdir}/04_sentiment.png")
+    add(_sent, "sentiment")
+
+    # 05 network of the picks
+    add(lambda: plot_network(pp, f"{outdir}/05_network.png", threshold=0.3), "network")
+
+    # 06 regime (market-level)
+    def _regime():
+        spy = _market_returns("SPY", "2015-01-01")
+        return plot_regime(spy, regime_probabilities(spy), f"{outdir}/06_regime.png")
+    add(_regime, "regime")
+
+    # 07 ML feature importance (universe)
+    add(lambda: plot_ml_importance(feature_importance(prices_all),
+                                   f"{outdir}/07_ml_importance.png"), "ml importance")
+
+    # 08 composite selection score (momentum + reversal, sector-neutralized)
+    sdf = pd.DataFrame({"momentum": mom.reindex(picks),
+                        "reversal": rev.reindex(picks)}).fillna(0.0)
+    sdf["SCORE"] = neutral.reindex(picks)
+    add(lambda: plot_screen_scores(sdf, f"{outdir}/08_scores.png"), "scores")
+
+    # 09-10 Markowitz distribution
+    mu, Sig, tickers = returns_stats(pp)
+    n = len(tickers)
+    w_ms = minimize(lambda w: -sharpe_ratio(w, mu, Sig, rf), np.repeat(1/n, n),
+                    method="SLSQP", bounds=[(0, cap)] * n,
+                    constraints=[{"type": "eq", "fun": lambda w: w.sum() - 1}]).x
+    w_mv = min_variance(Sig)
+    add(lambda: plot_efficient_frontier(mu, Sig, tickers, w_ms, w_mv, rf,
+                                        f"{outdir}/09_frontier.png"), "frontier")
+    add(lambda: plot_weights(w_ms, tickers, f"{outdir}/10_weights.png",
+                             "Max-Sharpe (sector-neutral picks)"), "weights (max-sharpe)")
+    add(lambda: plot_weights(w_mv, tickers, f"{outdir}/11_weights_minvar.png",
+                             "Min-Variance (sector-neutral picks)"), "weights (min-var)")
+
+    # 12 walk-forward backtest of the sector-neutral STRATEGY
+    def _bt():
+        def sn_score(window):
+            wp = factor_panels(window)
+            m = zscore(wp["momentum_12_1"].iloc[-1].dropna())
+            r = zscore(wp["reversal"].iloc[-1].dropna())
+            return sector_neutralize(zscore(m.add(r, fill_value=0)), sectors)
+        sel = lambda s: select_sector_capped(s, sectors, top_n, max_per_sector)
+        res = walk_forward(prices_all, sn_score, lambda w, p: weight_max_sharpe(w, p),
+                           top_n=top_n, lookback=504, rebalance=21, cost_bps=10,
+                           select_fn=sel)
+        _, bench = benchmark_equal_weight(prices_all, start_from=504)
+        bench = bench.reindex(res["returns"].index).fillna(0.0)
+        return plot_backtest(res["returns"], bench, f"{outdir}/12_backtest.png")
+    add(_bt, "backtest")
+
+    print(f"Wrote {len(paths)} figures to ./{outdir}/  (portfolio: {picks})")
+    return paths
+
+
 if __name__ == "__main__":
-    make_all()
+    import sys
+    if "--portfolio" in sys.argv:
+        make_portfolio_charts()
+    else:
+        make_all()

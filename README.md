@@ -97,8 +97,10 @@ python3 backtester.py --ml  # ...include the ML ranker (slower)
 python3 factor_analysis.py  # per-factor IC + quantile analysis (which signals predict?)
 python3 universe.py         # build tradeable universe from S&P 1500 -> universe.csv
 python3 paper_trader.py     # forward paper-trade one rebalance -> track record
-python3 visualize.py   # generate ALL model figures into ./figures/
-pytest                 # full offline test suite (113 tests)
+python3 visualize.py             # model figures for the 24-name universe -> ./figures/
+python3 visualize.py --portfolio # full chart set for the sector-neutral portfolio
+                                 #   -> ./figures_sectorneutral/  (uses cached prices)
+pytest                 # full offline test suite (125 tests)
 pytest -q tests/test_visualize.py   # just the visualization tests
 ```
 
@@ -150,7 +152,9 @@ autoPortfolio/
 ├── universe_tickers.txt eligible ticker list          (generated)
 ├── paper_state.json     paper account state           (generated)
 ├── paper_track_record.csv  forward NAV history        (generated)
-├── visualize.py         all model figures → figures/
+├── sector_select.py     sector-neutral ranking + sector-capped selection
+├── visualize.py         all model figures → figures/ (+ --portfolio → figures_sectorneutral/)
+├── figures_sectorneutral/  full chart set for the sector-neutral portfolio (generated)
 ├── figures/             generated PNGs
 └── tests/               79 offline tests (one file per module)
 ```

@@ -37,7 +37,8 @@ TRADING_DAYS = 252
 # Core walk-forward engine
 # ----------------------------------------------------------------------
 def walk_forward(prices: pd.DataFrame, score_fn, weight_fn, *,
-                 top_n=8, lookback=504, rebalance=21, cost_bps=10.0):
+                 top_n=8, lookback=504, rebalance=21, cost_bps=10.0,
+                 select_fn=None):
     """
     Returns a dict with the daily equity curve, the weights history, the
     per-rebalance turnover, and the daily portfolio returns.
@@ -65,7 +66,10 @@ def walk_forward(prices: pd.DataFrame, score_fn, weight_fn, *,
         scores = score_fn(window)
         if scores is None or scores.dropna().empty:
             continue
-        picks = list(scores.sort_values(ascending=False).head(top_n).index)
+        picks = (select_fn(scores) if select_fn
+                 else list(scores.sort_values(ascending=False).head(top_n).index))
+        if not picks:
+            continue
         w = weight_fn(window, picks)
         W.loc[t, w.index] = w.values
 
