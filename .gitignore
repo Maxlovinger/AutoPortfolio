@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Runtime state / generated at run time
+paper_state.json
+paper_track_record.csv
+ibkr_track_record.csv
+
+# OS
+.DS_Store
+
+# Optional: regenerable via `python3 universe.py` — uncomment to stop tracking
+# universe.csv
+# universe_candidates.csv
+# universe_tickers.txt
