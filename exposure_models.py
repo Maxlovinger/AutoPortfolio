@@ -188,6 +188,26 @@ def exposure_vix_percentile(returns: pd.Series, vix: pd.Series, q=0.90,
     return exp
 
 
+def banded_exposure(target_exposure: pd.Series, band=0.10, check_every=1) -> pd.Series:
+    """Turn a continuously-varying target exposure into a tradeable one that only
+    moves when it drifts beyond a no-trade band, and only on check days.
+
+    band        : only re-trade exposure when |target - held| > band (e.g. 0.10).
+    check_every : days between checks (1 = daily, 5 = weekly, 63 = quarterly).
+
+    Reduces exposure turnover (and cost) while preserving most of the risk
+    control. `target_exposure` must already be non-anticipating."""
+    t = target_exposure.values
+    n = len(t)
+    held = np.empty(n)
+    cur = t[0] if (n and np.isfinite(t[0])) else 1.0
+    for i in range(n):
+        if i % check_every == 0 and np.isfinite(t[i]) and abs(t[i] - cur) > band:
+            cur = t[i]
+        held[i] = cur
+    return pd.Series(held, index=target_exposure.index)
+
+
 def apply_exposure(returns: pd.Series, exposure: pd.Series):
     e = exposure.reindex(returns.index).fillna(1.0)
     return returns * e, e
