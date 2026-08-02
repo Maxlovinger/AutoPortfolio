@@ -1,0 +1,31 @@
+# Core
+numpy
+pandas
+scipy
+yfinance
+matplotlib
+
+# Model E — learning-to-rank (LambdaMART)
+lightgbm
+
+# Model D — regime detection
+hmmlearn
+statsmodels        # fallback regime model
+
+# Model B — news sentiment
+vaderSentiment
+nltk               # fallback sentiment (needs: python -m nltk.downloader vader_lexicon)
+
+# Model C — correlation network
+networkx
+
+# ML utilities + testing
+scikit-learn
+pytest
+
+# --- Environment notes ---
+# * xgboost was intentionally NOT used: this Anaconda has a libomp version
+#   conflict (missing symbol ___kmpc_dispatch_deinit). LightGBM's LGBMRanker
+#   (LambdaMART) is the stronger choice for ranking anyway.
+# * hmmlearn's KMeans init requires a working threadpoolctl. If the HMM regime
+#   silently falls back to 'markov', run:  pip install -U threadpoolctl
