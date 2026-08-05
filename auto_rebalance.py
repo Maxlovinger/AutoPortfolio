@@ -22,6 +22,7 @@ SAFETY
 from __future__ import annotations
 import json
 import os
+import re
 import datetime as dt
 import numpy as np
 import pandas as pd
@@ -31,8 +32,11 @@ LOG_MD = "decision_log.md"
 LOG_JSONL = "decision_log.jsonl"
 
 # ---- LOCKED PARAMETERS (mirror final_strategy.py) ----
-TRADE_CAPITAL = 40_000.0     # $ to actually deploy (rest of the account stays cash);
-                             # set to None to use the full account NAV.
+TRADE_CAPITAL = None         # None = deploy the FULL account NAV (100% invested,
+                             # no structurally idle cash). Set to a $ number to
+                             # instead cap deployment and leave the rest in cash.
+                             # We reset the paper account to a small balance in
+                             # Client Portal, so full-NAV == the whole ~$40k book.
 BASKET_N = 30
 MAX_PER_SECTOR = 5
 TARGET_VOL = 0.15
@@ -82,15 +86,29 @@ def decide_exposure(vol, held, target=TARGET_VOL, band=EXPOSURE_BAND):
             f"band) so NO CHANGE")
 
 
+def _base_company(name: str) -> str:
+    """Collapse a share-class label to its underlying company, so dual-class
+    tickers (GOOG/GOOGL 'Alphabet Inc. (Class C/A)', FOX/FOXA, NWS/NWSA) map to
+    one name and we don't hold the same company twice."""
+    return re.sub(r"\s*\(Class [A-Z]\)\s*$", "", str(name)).strip()
+
+
 def select_book(adv: pd.Series, sectors: dict, valid: set,
-                n=BASKET_N, cap=MAX_PER_SECTOR) -> list[str]:
-    """The 30 most-liquid *currently-priced* names, <= cap per sector."""
+                n=BASKET_N, cap=MAX_PER_SECTOR, names: dict | None = None) -> list[str]:
+    """The 30 most-liquid *currently-priced* names, <= cap per sector, with at
+    most ONE share class per company (keeps the most-liquid class, since we scan
+    in descending-ADV order)."""
     ranked = adv[adv.index.isin(valid)].sort_values(ascending=False)
-    picks, counts = [], {}
+    picks, counts, seen_co = [], {}, set()
     for t in ranked.index:
         sec = sectors.get(t, "Unknown")
         if counts.get(sec, 0) >= cap:
             continue
+        if names is not None:
+            co = _base_company(names.get(t, t))
+            if co in seen_co:          # already hold this company's other class
+                continue
+            seen_co.add(co)
         picks.append(t)
         counts[sec] = counts.get(sec, 0) + 1
         if len(picks) >= n:
@@ -144,15 +162,17 @@ def log_decision(record: dict, rationale_lines: list[str]):
 # ----------------------------------------------------------------------
 # The scheduled run
 # ----------------------------------------------------------------------
-def run(kind="sim", dry_run=True, port=7497, today=None, verbose=True, moo=False):
+def run(kind="sim", dry_run=True, port=7497, today=None, verbose=True, moo=False,
+        force_exposure=None):
     from data import download_prices
-    from sector_select import load_sectors
+    from sector_select import load_sectors, load_names
     from costs import load_adv
     from paper_trader import plan_orders, make_broker
 
     today = pd.Timestamp(today or dt.date.today())
     state = load_state()
     sectors = load_sectors("universe.csv")
+    names = load_names("universe.csv")
     adv = load_adv("universe.csv")
 
     do_reb = is_rebalance_day(today, state["last_rebalance"])
@@ -174,7 +194,7 @@ def run(kind="sim", dry_run=True, port=7497, today=None, verbose=True, moo=False
     rationale = [f"Run type: {'QUARTERLY REBALANCE + ' if do_reb else ''}"
                  f"{'weekly exposure check' if do_exp else ''}."]
     if do_reb:
-        picks = select_book(adv, sectors, valid)
+        picks = select_book(adv, sectors, valid, names=names)
         prev = set(state.get("last_holdings", []))
         added = [t for t in picks if t not in prev]
         dropped = [t for t in prev if t not in picks]
@@ -192,7 +212,15 @@ def run(kind="sim", dry_run=True, port=7497, today=None, verbose=True, moo=False
     book_prices = prices[[t for t in picks if t in prices.columns]]
     book_ret = book_prices.pct_change(fill_method=None).mean(axis=1)  # equal-weight
     vol = realized_vol(book_ret)
-    new_exp, changed, exp_reason = decide_exposure(vol, float(state["held_exposure"]))
+    if force_exposure is not None:
+        # Manual override: pin exposure (e.g. an off-cadence holdings fix where we
+        # deliberately DON'T re-run the weekly vol-target review).
+        held = float(state["held_exposure"])
+        new_exp, changed = float(force_exposure), float(force_exposure) != held
+        exp_reason = (f"PINNED to {new_exp*100:.0f}% (manual override; weekly "
+                      f"vol-target review left for the scheduled Monday run).")
+    else:
+        new_exp, changed, exp_reason = decide_exposure(vol, float(state["held_exposure"]))
     rationale.append("Exposure: " + exp_reason)
     state["held_exposure"] = new_exp
 
@@ -211,7 +239,11 @@ def run(kind="sim", dry_run=True, port=7497, today=None, verbose=True, moo=False
         if kind == "ibkr":
             import time
             from paper_trader import plan_orders as _po
-            current = {k: int(v) for k, v in broker._ibkr.positions(broker.app).items()}
+            # IBKR reports class shares with a SPACE ("BRK B"); our target names
+            # use a DASH ("BRK-B"). Normalize so held shares reconcile against
+            # targets — otherwise every rebalance re-buys them as if unheld.
+            current = {k.replace(" ", "-"): int(v)
+                       for k, v in broker._ibkr.positions(broker.app).items()}
             orders = _po(weights, latest, nav, current)
             if not dry_run:
                 order_builder = (broker._ibkr.market_on_open_order if moo

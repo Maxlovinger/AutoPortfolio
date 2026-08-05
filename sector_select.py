@@ -23,6 +23,14 @@ def load_sectors(path="universe.csv") -> dict:
     return df[col].fillna("Unknown").astype(str).to_dict()
 
 
+def load_names(path="universe.csv") -> dict:
+    """ticker -> company name (used to de-duplicate dual-class share classes)."""
+    df = pd.read_csv(path, index_col=0)
+    if "name" not in df.columns:
+        return {}
+    return df["name"].fillna("").astype(str).to_dict()
+
+
 def sector_neutralize(scores: pd.Series, sectors: dict) -> pd.Series:
     """Z-score the factor WITHIN each sector (comparable across sectors)."""
     sec = pd.Series({t: sectors.get(t, "Unknown") for t in scores.index})
