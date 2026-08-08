@@ -37,6 +37,19 @@ def make_regime_spot(seed=0):
     return pd.DataFrame(spot, index=idx), idx, stress
 
 
+def make_regime_tone(spot, idx, stress, tz=False):
+    """Monthly country-tone panel: tone turns NEGATIVE during the stress window
+    (so risk_tone = -mean turns positive there). Optionally tz-aware (like GDELT)."""
+    m_idx = pd.date_range(spot.index[0], spot.index[-1],
+                          freq="M", tz="UTC" if tz else None)
+    ccys = list(spot.columns)
+    # per business-day stress -> monthly stress fraction, mapped to tone
+    stress_ser = pd.Series(stress.astype(float), index=idx).resample("M").mean()
+    stress_m = stress_ser.reindex(m_idx if not tz else m_idx.tz_localize(None)).fillna(0.0)
+    data = {c: (0.3 - 1.2 * stress_m.values) for c in ccys}   # +0.3 calm, -0.9 stress
+    return pd.DataFrame(data, index=m_idx)
+
+
 # --- features --------------------------------------------------------------
 def test_crash_features_rise_in_stress():
     spot, idx, stress = make_regime_spot()
@@ -133,6 +146,55 @@ def test_run_regime_overlay_shape():
     res = reg.run_regime_overlay(base, spot, train_end=str(idx[900].date()))
     assert len(res["equity"]) > 0
     assert res["exposure"].notna().all()
+
+
+# --- Path B: news risk-off tone feature ------------------------------------
+def test_tone_adds_risk_tone_feature_col():
+    spot, idx, stress = make_regime_spot()
+    tone = make_regime_tone(spot, idx, stress)
+    feats = reg.crash_features(spot, freq="M", tone_panel=tone)
+    assert list(feats.columns)[:2] == ["fx_vol", "haven_spread"]   # fx_vol stays col 0
+    assert "risk_tone" in feats.columns
+
+
+def test_risk_tone_high_in_stress():
+    spot, idx, stress = make_regime_spot()
+    tone = make_regime_tone(spot, idx, stress)
+    feats = reg.crash_features(spot, freq="M", tone_panel=tone)
+    hi = feats["risk_tone"][(feats.index >= idx[850]) & (feats.index <= idx[1100])]
+    lo = feats["risk_tone"][(feats.index < idx[800])]
+    assert hi.mean() > lo.mean()          # tone negative in stress -> risk_tone up
+
+
+def test_tone_feature_handles_tz_aware_panel():
+    spot, idx, stress = make_regime_spot()
+    tone = make_regime_tone(spot, idx, stress, tz=True)      # GDELT-style UTC index
+    assert tone.index.tz is not None
+    feats = reg.crash_features(spot, freq="M", tone_panel=tone)   # must not crash
+    assert "risk_tone" in feats.columns
+
+
+def test_tone_feature_no_lookahead_truncation_invariance():
+    spot, idx, stress = make_regime_spot()
+    tone = make_regime_tone(spot, idx, stress)
+    feats = reg.crash_features(spot, freq="M", tone_panel=tone)
+    T = str(idx[1150].date())
+    cut = idx[1200]
+    p_full = reg.causal_stress_prob(feats, train_end=T)
+    p_trunc = reg.causal_stress_prob(feats[feats.index <= cut], train_end=T)
+    both = p_trunc.index
+    assert np.allclose(p_full.reindex(both).values, p_trunc.values, atol=1e-6)
+
+
+def test_run_holdout_adds_tone_book():
+    spot, carry = make_carry_world(n_days=1600)
+    # build a tone panel matching the carry_world currencies
+    m_idx = pd.date_range(spot.index[0], spot.index[-1], freq="M")
+    tone = pd.DataFrame(np.random.default_rng(0).normal(0, 0.3,
+                        (len(m_idx), spot.shape[1])), index=m_idx, columns=spot.columns)
+    out = reg.run_holdout(spot, carry, train_end="2020-06-30", freq="M",
+                          tone_panel=tone)
+    assert set(out) == {"carry", "carry+regime", "carry+regime+tone"}
 
 
 def test_run_holdout_reports_full_and_test():

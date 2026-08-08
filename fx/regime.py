@@ -39,10 +39,15 @@ HIGH_BETA = ["AUD", "NZD"]
 
 
 # --- features --------------------------------------------------------------
-def crash_features(spot: pd.DataFrame, freq="M", vol_months=3) -> pd.DataFrame:
-    """Two causal, cross-asset crash features on the trade grid.
-    fx_vol rises in stress; haven_spread turns positive when havens outperform
-    high-beta (a risk-off tell)."""
+def crash_features(spot: pd.DataFrame, freq="M", vol_months=3,
+                   tone_panel=None) -> pd.DataFrame:
+    """Causal, cross-asset crash features on the trade grid. fx_vol rises in
+    stress; haven_spread turns positive when havens outperform high-beta.
+
+    Optional third feature `risk_tone` = NEGATIVE of broad cross-currency news
+    tone, so it rises when news turns risk-off — a JUMP-anticipating input that
+    realized vol can't provide (news deteriorates before vol spikes). fx_vol is
+    kept as column 0 so the 'stress = higher fx_vol mean' identification holds."""
     px = resample_spot(spot, freq)
     ret = px.pct_change()
     ppy = FREQ[freq]["ppy"]
@@ -53,8 +58,16 @@ def crash_features(spot: pd.DataFrame, freq="M", vol_months=3) -> pd.DataFrame:
     hb = [c for c in HIGH_BETA if c in ret.columns]
     haven_spread = ret[havens].mean(axis=1) - ret[hb].mean(axis=1)
 
-    feats = pd.DataFrame({"fx_vol": fx_vol, "haven_spread": haven_spread})
-    return feats.dropna()
+    feats = pd.DataFrame({"fx_vol": fx_vol, "haven_spread": haven_spread}).dropna()
+
+    if tone_panel is not None and not tone_panel.empty:
+        tp = tone_panel
+        if getattr(tp.index, "tz", None) is not None:
+            tp = tp.copy(); tp.index = tp.index.tz_localize(None)
+        # broad risk-off intensity; ffill onto the grid, 0 where no tone yet
+        risk_tone = (-tp.mean(axis=1)).reindex(feats.index).ffill().fillna(0.0)
+        feats["risk_tone"] = risk_tone
+    return feats
 
 
 # --- causal filtered stress probability ------------------------------------
@@ -117,21 +130,24 @@ def viterbi_states(feats: pd.DataFrame, train_end) -> pd.Series:
 
 # --- overlay ---------------------------------------------------------------
 def regime_exposure(spot, freq="M", train_end="2019-12-31", floor=0.0,
-                    stress_weight=1.0, vol_months=3) -> pd.Series:
+                    stress_weight=1.0, vol_months=3, tone_panel=None) -> pd.Series:
     """Causal exposure multiplier = clip(1 - stress_weight * P(stress), floor, 1),
-    lagged one period so the position uses only prior-period information."""
-    feats = crash_features(spot, freq, vol_months)
+    lagged one period so the position uses only prior-period information.
+    Pass tone_panel to add the news risk-off feature to the HMM."""
+    feats = crash_features(spot, freq, vol_months, tone_panel=tone_panel)
     p = causal_stress_prob(feats, train_end)
     exp = (1 - stress_weight * p).clip(lower=floor, upper=1.0)
     return exp.shift(1).dropna()                             # no look-ahead
 
 
 def run_regime_overlay(base_result: dict, spot, train_end="2019-12-31",
-                       floor=0.0, stress_weight=1.0, cost_bps=5.0) -> dict:
+                       floor=0.0, stress_weight=1.0, cost_bps=5.0,
+                       tone_panel=None) -> dict:
     """Apply the HMM crash overlay to a carry backtest result."""
     freq = base_result["freq"]
     r = base_result["net_ret"]
-    exp = regime_exposure(spot, freq, train_end, floor, stress_weight)
+    exp = regime_exposure(spot, freq, train_end, floor, stress_weight,
+                          tone_panel=tone_panel)
     net, k = apply_overlay(r, exp.reindex(r.index).ffill().fillna(1.0), cost_bps)
     net = net.dropna()
     return {
@@ -146,16 +162,24 @@ def run_regime_overlay(base_result: dict, spot, train_end="2019-12-31",
 
 # --- held-out evaluation ---------------------------------------------------
 def run_holdout(spot, carry, train_end="2019-12-31", freq="M",
-                stress_weight=1.0, cost_bps=5.0) -> dict:
-    """Compare plain carry vs carry+regime on the TEST slice (dates>train_end),
-    the honest bar. HMM params are fit only on <=train_end."""
+                stress_weight=1.0, cost_bps=5.0, tone_panel=None) -> dict:
+    """Compare plain carry vs carry+regime (vol+haven) vs carry+regime+tone on
+    the TEST slice (dates>train_end), the honest bar. HMM params fit only on
+    <=train_end. The 3rd book (news risk-off feature) is added iff tone given."""
     base = run_carry_backtest(spot, carry, freq=freq, cost_bps=cost_bps)
     over = run_regime_overlay(base, spot, train_end=train_end,
                               stress_weight=stress_weight, cost_bps=cost_bps)
+    books = [("carry", base), ("carry+regime", over)]
+    if tone_panel is not None:
+        over_t = run_regime_overlay(base, spot, train_end=train_end,
+                                    stress_weight=stress_weight, cost_bps=cost_bps,
+                                    tone_panel=tone_panel)
+        books.append(("carry+regime+tone", over_t))
+
     ppy = FREQ[freq]["ppy"]
     test = pd.Timestamp(train_end)
     out = {}
-    for name, res in (("carry", base), ("carry+regime", over)):
+    for name, res in books:
         full = summarize(res)
         tslice = performance(res["net_ret"][res["net_ret"].index > test], ppy)
         out[name] = {"full": full, "test": tslice}
@@ -164,16 +188,36 @@ def run_holdout(spot, carry, train_end="2019-12-31", freq="M",
 
 if __name__ == "__main__":
     from fx.data import load_all
+    from fx.sentiment import tone_panel_from_gdelt
 
     d = load_all(start="2010-01-01")
     spot, carry = d["spot"], d["carry"]
-    res = run_holdout(spot, carry, train_end="2019-12-31")
 
-    print(f"{'':16}{'FULL':>26}{'TEST (>2019)':>26}")
-    print(f"{'':16}{'sharpe':>9}{'maxDD':>9}{'skew':>8}{'sharpe':>9}{'maxDD':>9}{'skew':>8}")
+    # Path B: fetch broad country news tone (only ~10 GDELT queries) and add it
+    # as a risk-off feature to the crash overlay. Needs a non-datacenter IP.
+    print("Fetching country news tone (10 currencies) from GDELT...", flush=True)
+    try:
+        # GDELT DOC API coverage starts ~2017; 96m (8y) stays within it. The
+        # printed per-economy span tells us how far back tone actually goes —
+        # the HMM trains on <=train_end, so we need tone in that window.
+        tone = tone_panel_from_gdelt(list(carry.columns) + ["USD"], timespan="96m")
+        if tone.empty:
+            tone = None
+            print("  no tone (GDELT 429-blocked?). Showing vol+haven overlay only.")
+        else:
+            print(f"  tone for {tone.shape[1]} economies, "
+                  f"{tone.index.min().date()}..{tone.index.max().date()}")
+    except Exception as e:
+        tone = None
+        print(f"  tone fetch failed ({str(e)[:40]}); vol+haven overlay only.")
+
+    res = run_holdout(spot, carry, train_end="2019-12-31", tone_panel=tone)
+
+    print(f"\n{'':18}{'FULL':>26}{'TEST (>2019)':>26}")
+    print(f"{'':18}{'sharpe':>9}{'maxDD':>9}{'skew':>8}{'sharpe':>9}{'maxDD':>9}{'skew':>8}")
     for name, m in res.items():
         f, t = m["full"], m["test"]
-        print(f"{name:16}{f['sharpe']:>9.3f}{f['max_dd']:>9.3f}{f['skew']:>8.2f}"
+        print(f"{name:18}{f['sharpe']:>9.3f}{f['max_dd']:>9.3f}{f['skew']:>8.2f}"
               f"{t['sharpe']:>9.3f}{t['max_dd']:>9.3f}{t['skew']:>8.2f}")
 
     # Viterbi validation: does it flag the known crash episodes?

@@ -40,18 +40,20 @@ CACHE_DIR = os.path.join(os.path.dirname(__file__), ".gdelt_cache")
 # (cached names return instantly, only the failed ones retry).
 THROTTLE_SEC = 3.0
 
-# currency -> a query that isolates that economy's news (FX sleeve)
+# currency -> a SINGLE quoted phrase (GDELT TimelineTone chokes on complex boolean
+# OR queries; single phrases like the equity path work). Central-bank tone is also
+# the most FX-relevant news signal — policy/risk sentiment drives currencies.
 CCY_QUERY = {
-    "EUR": '"euro zone" OR "European Central Bank" OR eurozone economy',
-    "GBP": '"United Kingdom" economy OR "Bank of England"',
-    "JPY": 'Japan economy OR "Bank of Japan"',
-    "CHF": 'Switzerland economy OR "Swiss National Bank"',
-    "AUD": 'Australia economy OR "Reserve Bank of Australia"',
-    "NZD": '"New Zealand" economy OR "Reserve Bank of New Zealand"',
-    "CAD": 'Canada economy OR "Bank of Canada"',
-    "SEK": 'Sweden economy OR Riksbank',
-    "NOK": 'Norway economy OR Norges Bank',
-    "USD": '"United States" economy OR "Federal Reserve"',
+    "EUR": '"European Central Bank"',
+    "GBP": '"Bank of England"',
+    "JPY": '"Bank of Japan"',
+    "CHF": '"Swiss National Bank"',
+    "AUD": '"Reserve Bank of Australia"',
+    "NZD": '"Reserve Bank of New Zealand"',
+    "CAD": '"Bank of Canada"',
+    "SEK": '"Sveriges Riksbank"',
+    "NOK": '"Norges Bank"',
+    "USD": '"Federal Reserve"',
 }
 
 
@@ -132,10 +134,21 @@ def country_tone(ccy: str, **kw) -> pd.Series:
 
 
 def country_tone_panel(ccys, **kw) -> pd.DataFrame:
-    """Monthly tone for several currencies -> one column each (FX sentiment)."""
+    """Monthly tone for several currencies -> one column each (FX sentiment).
+    Per-currency error handling so one 429 doesn't drop the whole panel; prints
+    progress + the actual date span (reruns resume from the per-query cache)."""
     cols = {}
-    for c in ccys:
-        s = country_tone(c, **kw)
-        if not s.empty:
+    n = len(ccys)
+    print(f"Fetching country tone for {n} economies "
+          f"(reruns resume from .gdelt_cache/)...", flush=True)
+    for i, c in enumerate(ccys, 1):
+        try:
+            s = country_tone(c, **kw)
+            note = (f"{len(s)} pts, {s.index.min().date()}..{s.index.max().date()}"
+                    if not s.empty else "empty")
+        except Exception as e:
+            s, note = None, f"FAILED ({str(e)[:34]})"
+        print(f"  [{i:>2}/{n}] {c:<4} -> {note}", flush=True)
+        if s is not None and not s.empty:
             cols[c] = s
     return pd.DataFrame(cols)

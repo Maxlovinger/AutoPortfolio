@@ -24,10 +24,26 @@ import os
 import numpy as np
 import pandas as pd
 import yfinance as yf
-from dotenv import load_dotenv
 from fredapi import Fred
 
 from utils import MONTH_END
+
+try:
+    from dotenv import load_dotenv
+except ImportError:                      # python-dotenv not installed -> parse .env ourselves
+    def load_dotenv(*a, **k):
+        here = os.path.dirname(__file__)
+        for cand in (".env", os.path.join(here, "..", ".env"), os.path.join(here, ".env")):
+            if os.path.exists(cand):
+                with open(cand) as fh:
+                    for line in fh:
+                        line = line.strip()
+                        if line and not line.startswith("#") and "=" in line:
+                            key, val = line.split("=", 1)
+                            os.environ.setdefault(key.strip(),
+                                                  val.strip().strip('"').strip("'"))
+                return True
+        return False
 
 # --- Universe config -------------------------------------------------------
 # For each currency vs USD:
