@@ -1,8 +1,10 @@
-"""Tests for the (B) news-sentiment overlay — news feed is monkeypatched."""
+"""Tests for the (B) equity news-sentiment overlay — news feed is monkeypatched.
+Scoring detail lives in test_news_sentiment.py; here we test the per-ticker
+fetch -> aggregate -> cross-sectional z-score wiring."""
 import numpy as np
 import pytest
 import sentiment
-from sentiment import sentiment_scores, _score_texts, _analyzer
+from sentiment import sentiment_scores
 
 
 HEADLINES = {
@@ -13,32 +15,30 @@ HEADLINES = {
 }
 
 
-def test_score_empty_is_neutral():
-    assert _score_texts([], _analyzer()) == 0.0
-
-
-def test_score_positive_beats_negative():
-    sia = _analyzer()
-    pos = _score_texts(["fantastic record profit surge beat upgrade"], sia)
-    neg = _score_texts(["terrible fraud lawsuit loss downgrade plunge"], sia)
-    assert pos > neg
-
-
-def test_fallback_lexicon_directionally_correct():
-    # force fallback path (sia=None)
-    pos = _score_texts(["surge record growth strong buy gain"], None)
-    neg = _score_texts(["cut downgrade lawsuit weak sell loss"], None)
-    assert pos > 0 > neg
-
-
 def test_sentiment_scores_ranking(monkeypatch):
     monkeypatch.setattr(sentiment, "_headline_texts", lambda t: HEADLINES[t])
-    s = sentiment_scores(["AAA", "BBB", "CCC", "DDD"])
-    assert s["AAA"] > s["BBB"]
+    # force the lightweight scorer so the test never needs the FinBERT model
+    s = sentiment_scores(["AAA", "BBB", "CCC", "DDD"], prefer="vader")
+    assert s["AAA"] > s["BBB"]                       # good news ranks above bad
     assert set(s.index) == {"AAA", "BBB", "CCC", "DDD"}
 
 
 def test_no_news_all_neutral(monkeypatch):
     monkeypatch.setattr(sentiment, "_headline_texts", lambda t: [])
-    s = sentiment_scores(["AAA", "BBB", "CCC"])
+    s = sentiment_scores(["AAA", "BBB", "CCC"], prefer="vader")
     assert (s == 0).all()
+
+
+def test_scores_are_zscored(monkeypatch):
+    monkeypatch.setattr(sentiment, "_headline_texts", lambda t: HEADLINES[t])
+    s = sentiment_scores(["AAA", "BBB", "CCC", "DDD"], prefer="vader")
+    # z-scored cross-section -> approximately mean zero
+    assert abs(s.mean()) < 1e-9
+
+
+def test_finbert_default_falls_back_gracefully(monkeypatch):
+    # even if FinBERT is absent, default prefer="finbert" must still return
+    # a full neutral-or-ranked series (fallback chain), never crash
+    monkeypatch.setattr(sentiment, "_headline_texts", lambda t: HEADLINES[t])
+    s = sentiment_scores(["AAA", "BBB", "CCC", "DDD"])
+    assert set(s.index) == {"AAA", "BBB", "CCC", "DDD"}
