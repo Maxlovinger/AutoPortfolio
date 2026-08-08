@@ -4,10 +4,18 @@ model is actually present (guarded skip); the fallback chain (finbert -> vader
 -> bag-of-words) is tested deterministically via monkeypatching so it never
 needs the network.
 """
+import os
 import numpy as np
 import pytest
 
 import news_sentiment as ns
+
+# Loading the 440MB FinBERT model in the everyday suite is slow and can block on
+# a HuggingFace hub check; the fallback chain below is fully tested with mocks,
+# and FinBERT itself is validated out-of-band. Opt in with RUN_FINBERT=1.
+requires_finbert = pytest.mark.skipif(
+    not os.getenv("RUN_FINBERT"),
+    reason="set RUN_FINBERT=1 to run the real FinBERT model test")
 
 
 # --- fallback chain --------------------------------------------------------
@@ -51,15 +59,7 @@ def test_available_backend_reports_fallback(monkeypatch):
 
 
 # --- real FinBERT (only if the model is available locally) -----------------
-def _finbert_ready():
-    try:
-        ns._get_finbert()
-        return True
-    except Exception:
-        return False
-
-
-@pytest.mark.skipif(not _finbert_ready(), reason="FinBERT model not available")
+@requires_finbert
 def test_finbert_orders_financial_text():
     s = ns.score_texts([
         "Company beats earnings expectations and raises guidance",

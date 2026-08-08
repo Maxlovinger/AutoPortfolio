@@ -25,10 +25,12 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+from utils import MONTH_END
+
 # periods-per-year and holding fraction dt for each supported cadence
 FREQ = {
-    "M": {"rule": "M",     "ppy": 12,  "dt": 1 / 12},
-    "W": {"rule": "W-FRI", "ppy": 52,  "dt": 1 / 52},
+    "M": {"rule": MONTH_END, "ppy": 12,  "dt": 1 / 12},
+    "W": {"rule": "W-FRI",   "ppy": 52,  "dt": 1 / 52},
 }
 
 

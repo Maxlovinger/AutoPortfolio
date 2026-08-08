@@ -4,6 +4,21 @@ import numpy as np
 import pandas as pd
 
 
+def _detect_month_end_alias() -> str:
+    """pandas >=2.2 requires 'ME' for month-end resampling and rejects 'M';
+    older pandas requires 'M'. Detect once so the code runs on both."""
+    idx = pd.date_range("2020-01-01", periods=3, freq="D")
+    try:
+        pd.Series(0.0, index=idx).resample("ME").mean()
+        return "ME"
+    except (ValueError, KeyError):
+        return "M"
+
+
+# Month-end frequency alias valid on this pandas version.
+MONTH_END = _detect_month_end_alias()
+
+
 def zscore(s: pd.Series) -> pd.Series:
     """Cross-sectional z-score, robust to NaN and zero-variance."""
     s = s.astype(float)

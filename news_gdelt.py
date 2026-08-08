@@ -30,8 +30,15 @@ import urllib.request
 import numpy as np
 import pandas as pd
 
+from utils import MONTH_END
+
 DOC_URL = "https://api.gdeltproject.org/api/v2/doc/doc"
 CACHE_DIR = os.path.join(os.path.dirname(__file__), ".gdelt_cache")
+# GDELT rate-limits ~1 req / few sec; a polite delay AFTER each live fetch avoids
+# tripping 429s (which otherwise force slow backoffs). Cache hits don't sleep.
+# 3s spacing cut the 429 failure rate materially in testing; rerun to fill gaps
+# (cached names return instantly, only the failed ones retry).
+THROTTLE_SEC = 3.0
 
 # currency -> a query that isolates that economy's news (FX sleeve)
 CCY_QUERY = {
@@ -53,8 +60,11 @@ def _cache_path(params: dict) -> str:
     return os.path.join(CACHE_DIR, f"{key}.json")
 
 
-def _fetch(params: dict, retries=4, pause=5.0, use_cache=True) -> dict:
-    """GET the DOC API with backoff + on-disk cache. Raises on repeated 429."""
+def _fetch(params: dict, retries=3, pause=2.0, use_cache=True,
+           throttle=THROTTLE_SEC) -> dict:
+    """GET the DOC API with backoff + on-disk cache. Raises on repeated failure.
+    Cache HITS return immediately (no sleep); after a live fetch we pause
+    `throttle`s to stay under GDELT's rate limit."""
     os.makedirs(CACHE_DIR, exist_ok=True)
     cp = _cache_path(params)
     if use_cache and os.path.exists(cp):
@@ -71,10 +81,11 @@ def _fetch(params: dict, retries=4, pause=5.0, use_cache=True) -> dict:
             data = json.loads(body)
             with open(cp, "w") as fh:
                 json.dump(data, fh)
+            time.sleep(throttle)                     # polite spacing after a hit
             return data
         except Exception as e:                       # 429 / transient / JSON
             last = e
-            time.sleep(pause * (attempt + 1))
+            time.sleep(pause * (attempt + 1))        # 2s, 4s, 6s then give up
     raise RuntimeError(f"GDELT fetch failed after {retries} tries: {last}")
 
 
@@ -85,6 +96,9 @@ def _timeline_to_series(data: dict) -> pd.Series:
         return pd.Series(dtype=float)
     pts = tl[0].get("data", [])
     idx = pd.to_datetime([p["date"] for p in pts])
+    if getattr(idx, "tz", None) is not None:
+        idx = idx.tz_localize(None)          # GDELT stamps are UTC; drop tz so it
+                                             # aligns with tz-naive price/rate data
     vals = np.array([p["value"] for p in pts], dtype=float) / 10.0
     return pd.Series(np.clip(vals, -1, 1), index=idx).sort_index()
 
@@ -101,7 +115,7 @@ def monthly_tone(query: str, timespan="24m", use_cache=True) -> pd.Series:
     s = tone_timeline(query, timespan=timespan, use_cache=use_cache)
     if s.empty:
         return s
-    return s.resample("M").mean()
+    return s.resample(MONTH_END).mean()
 
 
 def entity_tone(name: str, **kw) -> pd.Series:

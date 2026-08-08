@@ -27,6 +27,8 @@ import yfinance as yf
 from dotenv import load_dotenv
 from fredapi import Fred
 
+from utils import MONTH_END
+
 # --- Universe config -------------------------------------------------------
 # For each currency vs USD:
 #   fred   : verified 3M interbank rate series (monthly, OECD)
@@ -71,7 +73,7 @@ def fetch_short_rates(start="2000-01-01", universe=G10) -> pd.DataFrame:
     rates = pd.DataFrame(cols)
     # Normalize to month-end so it aligns cleanly with resampled spot.
     rates.index = pd.to_datetime(rates.index)
-    rates = rates.resample("M").last()
+    rates = rates.resample(MONTH_END).last()
     return rates
 
 
@@ -111,7 +113,7 @@ def fetch_spot(start="2000-01-01", end=None, universe=G10) -> pd.DataFrame:
 def monthly_fx_returns(spot: pd.DataFrame) -> pd.DataFrame:
     """Month-end simple returns of the USD-per-foreign spot (the spot-return
     leg of total FX excess return; carry is added on top later)."""
-    m = spot.resample("M").last()
+    m = spot.resample(MONTH_END).last()
     return m.pct_change().dropna(how="all")
 
 

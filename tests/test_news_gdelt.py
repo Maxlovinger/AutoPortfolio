@@ -96,8 +96,8 @@ def test_fetch_uses_cache(tmp_path, monkeypatch):
 
     monkeypatch.setattr(g.urllib.request, "urlopen", fake_urlopen)
     p = {"query": "x", "mode": "TimelineTone", "format": "json", "timespan": "24m"}
-    g._fetch(p)                     # miss -> hits network, writes cache
-    g._fetch(p)                     # hit  -> served from disk
+    g._fetch(p, throttle=0)         # miss -> hits network, writes cache
+    g._fetch(p, throttle=0)         # hit  -> served from disk
     assert calls["n"] == 1
 
 

@@ -37,8 +37,13 @@ def test_scores_are_zscored(monkeypatch):
 
 
 def test_finbert_default_falls_back_gracefully(monkeypatch):
-    # even if FinBERT is absent, default prefer="finbert" must still return
-    # a full neutral-or-ranked series (fallback chain), never crash
+    # With the default prefer="finbert", if FinBERT is unavailable the scorer
+    # must fall back (VADER/bag-of-words) and still return a full ranked series,
+    # never crash. Force the FinBERT path to fail so no 440MB model is loaded.
+    import news_sentiment
+    monkeypatch.setattr(news_sentiment, "_get_finbert",
+                        lambda: (_ for _ in ()).throw(RuntimeError))
     monkeypatch.setattr(sentiment, "_headline_texts", lambda t: HEADLINES[t])
-    s = sentiment_scores(["AAA", "BBB", "CCC", "DDD"])
+    s = sentiment_scores(["AAA", "BBB", "CCC", "DDD"])   # default prefer="finbert"
     assert set(s.index) == {"AAA", "BBB", "CCC", "DDD"}
+    assert s["AAA"] > s["BBB"]                            # fallback still ranks

@@ -35,9 +35,19 @@ class _FinBert:
         from transformers import (AutoTokenizer,
                                    AutoModelForSequenceClassification)
         self.torch = torch
-        self.tok = AutoTokenizer.from_pretrained("ProsusAI/finbert")
-        self.mdl = AutoModelForSequenceClassification.from_pretrained(
-            "ProsusAI/finbert")
+
+        def _load(loader, name):
+            # Try the LOCAL cache first (no network) so we never hang on a
+            # HuggingFace hub check when offline/throttled; fall back to a
+            # one-time download only if the model isn't cached yet.
+            try:
+                return loader(name, local_files_only=True)
+            except Exception:
+                return loader(name)
+
+        self.tok = _load(AutoTokenizer.from_pretrained, "ProsusAI/finbert")
+        self.mdl = _load(AutoModelForSequenceClassification.from_pretrained,
+                         "ProsusAI/finbert")
         self.mdl.eval()
         # map label name -> index, robust to id2label ordering
         self.idx = {v.lower(): k for k, v in self.mdl.config.id2label.items()}

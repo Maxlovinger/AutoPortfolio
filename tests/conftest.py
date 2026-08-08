@@ -1,4 +1,12 @@
 """Shared fixtures + synthetic data generators. All tests run OFFLINE."""
+import os
+# Force HuggingFace/transformers fully offline for the whole test session BEFORE
+# anything imports them. The FinBERT weights are already cached, so tests never
+# need the network — this prevents from_pretrained from blocking on a hub check
+# (which hung the suite indefinitely on a throttled IP).
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+
 import numpy as np
 import pandas as pd
 import pytest
