@@ -80,3 +80,55 @@ def test_realized_vol_needs_history():
     assert np.isnan(ar.realized_vol(pd.Series([0.01, 0.02])))
     r = pd.Series(np.random.default_rng(0).normal(0, 0.01, 60))
     assert ar.realized_vol(r) > 0
+
+
+# ---------------------------------------------------------------- dual-class dedup
+def test_base_company_strips_share_class():
+    assert ar._base_company("Alphabet Inc. (Class C)") == "Alphabet Inc."
+    assert ar._base_company("Alphabet Inc. (Class A)") == "Alphabet Inc."
+    assert ar._base_company("Apple Inc.") == "Apple Inc."          # unchanged
+
+
+def test_select_book_dedup_keeps_most_liquid_class():
+    # GOOG more liquid than GOOGL; both are Alphabet -> keep only GOOG (higher ADV)
+    adv = pd.Series({"GOOG": 100, "GOOGL": 90, "AAPL": 80, "MSFT": 70})
+    sectors = {t: "Comm" if t.startswith("GOOG") else "Tech" for t in adv.index}
+    names = {"GOOG": "Alphabet Inc. (Class C)", "GOOGL": "Alphabet Inc. (Class A)",
+             "AAPL": "Apple Inc.", "MSFT": "Microsoft Corp."}
+    picks = ar.select_book(adv, sectors, valid=set(adv.index), n=3, cap=5, names=names)
+    assert "GOOG" in picks and "GOOGL" not in picks               # one class only
+    assert picks == ["GOOG", "AAPL", "MSFT"]
+
+
+def test_select_book_without_names_keeps_both_classes():
+    # backward compatible: no names dict -> no dedup (old behaviour)
+    adv = pd.Series({"GOOG": 100, "GOOGL": 90, "AAPL": 80})
+    sectors = {t: "X" for t in adv.index}
+    picks = ar.select_book(adv, sectors, valid=set(adv.index), n=3, cap=5)
+    assert "GOOG" in picks and "GOOGL" in picks
+
+
+# ---------------------------------------------------------------- position reconcile
+def test_normalize_positions_space_to_dash_and_int():
+    raw = {"BRK B": 2.0, "AAPL": 4.0, "BF B": 3.0}
+    out = ar.normalize_positions(raw)
+    assert out == {"BRK-B": 2, "AAPL": 4, "BF-B": 3}
+    assert all(isinstance(v, int) for v in out.values())
+
+
+def test_normalize_positions_fractional_keeps_float():
+    out = ar.normalize_positions({"BRK B": 2.5}, fractional=True)
+    assert out == {"BRK-B": 2.5}
+    assert isinstance(out["BRK-B"], float)
+
+
+def test_brk_b_not_rebought_after_reconcile():
+    # REGRESSION: held 'BRK B' must reconcile against target 'BRK-B' so a book
+    # already holding it generates NO order (previously it re-bought, overweighting).
+    from paper_trader import plan_orders
+    weights = ar.target_weights(["BRK-B", "AAPL"], exposure=1.0)   # 0.5 each
+    prices = pd.Series({"BRK-B": 500.0, "AAPL": 250.0})
+    nav = 2000.0                                    # target: BRK-B 2 sh, AAPL 4 sh
+    current = ar.normalize_positions({"BRK B": 2.0, "AAPL": 4.0})
+    trades = plan_orders(weights, prices, nav, current)
+    assert trades == []                             # already on target, no re-buy

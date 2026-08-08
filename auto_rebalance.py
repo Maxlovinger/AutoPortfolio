@@ -123,6 +123,18 @@ def target_weights(picks, exposure) -> pd.Series:
     return pd.Series(exposure / len(picks), index=picks)
 
 
+def normalize_positions(raw: dict, fractional: bool = False) -> dict:
+    """Reconcile IBKR's reported positions against our target symbols.
+
+    IBKR reports class shares with a SPACE ('BRK B', 'BF B') and every quantity
+    as a float; our target names use a DASH ('BRK-B'). Without normalizing the
+    KEY, a held 'BRK B' never matches target 'BRK-B', so every rebalance treats
+    it as unheld and re-buys it (the overweight-BRK-B bug). Cast the quantity to
+    int for whole-share trading, or keep float when trading fractional shares."""
+    cast = float if fractional else int
+    return {k.replace(" ", "-"): cast(v) for k, v in raw.items()}
+
+
 # ----------------------------------------------------------------------
 # State + rationale logging
 # ----------------------------------------------------------------------
@@ -150,7 +162,7 @@ def log_decision(record: dict, rationale_lines: list[str]):
         if record.get("orders"):
             f.write("\n**Orders:**\n\n")
             for o in record["orders"]:
-                f.write(f"    {o['action']:4s} {abs(o['shares']):>5d} "
+                f.write(f"    {o['action']:4s} {abs(o['shares']):>8.4g} "
                         f"{o['ticker']:6s} @ ~${o['price']}\n")
         else:
             f.write("\n*(no orders)*\n")
@@ -163,7 +175,7 @@ def log_decision(record: dict, rationale_lines: list[str]):
 # The scheduled run
 # ----------------------------------------------------------------------
 def run(kind="sim", dry_run=True, port=7497, today=None, verbose=True, moo=False,
-        force_exposure=None):
+        force_exposure=None, fractional=False):
     from data import download_prices
     from sector_select import load_sectors, load_names
     from costs import load_adv
@@ -239,20 +251,27 @@ def run(kind="sim", dry_run=True, port=7497, today=None, verbose=True, moo=False
         if kind == "ibkr":
             import time
             from paper_trader import plan_orders as _po
-            # IBKR reports class shares with a SPACE ("BRK B"); our target names
-            # use a DASH ("BRK-B"). Normalize so held shares reconcile against
-            # targets — otherwise every rebalance re-buys them as if unheld.
-            current = {k.replace(" ", "-"): int(v)
-                       for k, v in broker._ibkr.positions(broker.app).items()}
-            orders = _po(weights, latest, nav, current)
+            # normalize IBKR positions (space->dash keys, cast qty) so held shares
+            # reconcile against targets — see normalize_positions().
+            current = normalize_positions(
+                broker._ibkr.positions(broker.app), fractional=fractional)
+            orders = _po(weights, latest, nav, current, fractional=fractional)
+            if fractional and moo:
+                moo = False             # fractional shares aren't allowed on OPG
+                rationale.append("Fractional mode: using regular MKT orders "
+                                 "(Market-on-Open does not support fractional shares).")
             if not dry_run:
                 order_builder = (broker._ibkr.market_on_open_order if moo
                                  else broker._ibkr.market_order)
                 for o in orders:
                     oid = broker.app.next_order_id()
-                    broker.app.placeOrder(oid, broker._ibkr.stock(o["ticker"]),
-                                          order_builder(o["action"],
-                                                        abs(o["shares"])))
+                    if fractional:
+                        # dollar-denominated order (cashQty); IB fills fractional
+                        order = broker._ibkr.fractional_market_order(
+                            o["action"], abs(o["shares"]) * o["price"])
+                    else:
+                        order = order_builder(o["action"], abs(o["shares"]))
+                    broker.app.placeOrder(oid, broker._ibkr.stock(o["ticker"]), order)
                     o["order_id"] = oid
                 # WAIT for TWS to acknowledge before disconnecting (else the async
                 # orders can be dropped when the socket closes). Poll orderStatus.
@@ -312,8 +331,9 @@ def main():
     dry_run = "--live" not in sys.argv
     port = 4002 if "--gateway" in sys.argv else 7497
     moo = "--moo" in sys.argv          # Market-on-Open: stage orders for next open
-    run(kind=kind, dry_run=dry_run, port=port, moo=moo)
-    print("\nUsage: python3 auto_rebalance.py [--ibkr] [--live] [--gateway]")
+    fractional = "--fractional" in sys.argv   # exact equal weight, no rounding cash drag
+    run(kind=kind, dry_run=dry_run, port=port, moo=moo, fractional=fractional)
+    print("\nUsage: python3 auto_rebalance.py [--ibkr] [--live] [--gateway] [--fractional]")
     print("  default = SimBroker dry-run. --ibkr routes to TWS. --live transmits.")
 
 

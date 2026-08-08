@@ -105,6 +105,28 @@ def market_on_open_order(action: str, quantity: int) -> Order:
     return o
 
 
+def fractional_market_order(action: str, cash_amount: float) -> Order:
+    """Dollar-denominated MKT order (buys/sells $cash_amount of the stock, filling
+    fractional shares). This is the ONLY fractional method IBKR accepts over the
+    API: a fractional *share quantity* is rejected with error 10243 ("use desktop
+    version"), so we specify a cash quantity (`cashQty`) instead.
+
+    REQUIREMENTS (else IBKR returns 10244 "Cash Quantity cannot be used"):
+      * the account must have US fractional-share trading permission enabled
+        (Client Portal > Settings > Trading Permissions / Trading Experience),
+      * regular trading hours, DAY tif (no Market-on-Open).
+    Lets a small account sit at exact equal weight with no whole-share cash drag."""
+    o = Order()
+    o.action = action
+    o.orderType = "MKT"
+    o.tif = "DAY"
+    o.cashQty = round(float(cash_amount), 2)   # dollar amount; IB fills fractional
+    for attr in ("eTradeOnly", "firmQuoteOnly"):
+        if hasattr(o, attr):
+            setattr(o, attr, False)
+    return o
+
+
 def connect_tws(host="127.0.0.1", port=7497, client_id=17, timeout=12) -> IBKRClient:
     """Connect and block until TWS sends the nextValidId handshake."""
     app = IBKRClient()

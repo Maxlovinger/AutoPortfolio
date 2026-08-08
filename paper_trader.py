@@ -129,27 +129,38 @@ class SimBroker:
 # Order planning (pure, testable) — shared target-share math
 # ----------------------------------------------------------------------
 def plan_orders(weights: pd.Series, prices: pd.Series, nav: float,
-                current: dict) -> list[dict]:
+                current: dict, fractional: bool = False,
+                min_notional: float = 1.0) -> list[dict]:
     """
     Given target weights, live prices, portfolio NAV and current share holdings,
-    return the whole-share BUY/SELL trades needed to reach the target.
+    return the BUY/SELL trades needed to reach the target.
     Names dropped from the target are fully sold.
+
+    fractional=False (default): whole-share targets (floor). Leaves rounding cash
+    idle on small accounts, but works on any account.
+    fractional=True: exact fractional-share targets (round to 4dp), so the book
+    can sit at exact equal weight with ~no idle cash. Requires the broker/account
+    to support fractional shares. Deltas whose notional is below `min_notional`
+    are skipped as dust.
     """
     target_shares = {}
     for t, w in weights.items():
         px = float(prices.get(t, np.nan))
         if np.isfinite(px) and px > 0:
-            target_shares[t] = int((nav * float(w)) // px)
+            target_shares[t] = round(nav * float(w) / px, 4) if fractional \
+                else int((nav * float(w)) // px)
     trades = []
     for t in set(current) | set(target_shares):
-        cur = int(current.get(t, 0))
-        tgt = int(target_shares.get(t, 0))
-        d = tgt - cur
+        cur = float(current.get(t, 0)) if fractional else int(current.get(t, 0))
+        tgt = target_shares.get(t, 0)
+        d = round(tgt - cur, 4) if fractional else int(tgt) - cur
         if d == 0:
             continue
         px = float(prices.get(t, np.nan))
         if not np.isfinite(px) or px <= 0:
             continue
+        if fractional and abs(d * px) < min_notional:
+            continue                    # skip sub-dollar dust trades
         trades.append({"ticker": t, "shares": d, "action": "BUY" if d > 0 else "SELL",
                        "price": round(px, 2)})
     return trades

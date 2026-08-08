@@ -16,6 +16,9 @@ auto_run.log
 launchd.out.log
 launchd.err.log
 
+# Secrets
+.env
+
 # OS
 .DS_Store
 
