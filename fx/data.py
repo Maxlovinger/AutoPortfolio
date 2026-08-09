@@ -64,6 +64,24 @@ G10 = {
     "NOK": {"fred": "IR3TIB01NOM156N", "ticker": "USDNOK=X", "invert": True},
 }
 
+# Emerging-market currencies (verified FRED 3M rate + yfinance spot, all quoted
+# USD-per-foreign so invert=True). These carry MUCH higher rate differentials but
+# also wider spreads and devaluation JUMP risk — see EM_COST_BPS in the backtest.
+EM = {
+    "MXN": {"fred": "IR3TIB01MXM156N", "ticker": "USDMXN=X", "invert": True},
+    "PLN": {"fred": "IR3TIB01PLM156N", "ticker": "USDPLN=X", "invert": True},
+    "CZK": {"fred": "IR3TIB01CZM156N", "ticker": "USDCZK=X", "invert": True},
+    "HUF": {"fred": "IR3TIB01HUM156N", "ticker": "USDHUF=X", "invert": True},
+    "KRW": {"fred": "IR3TIB01KRM156N", "ticker": "USDKRW=X", "invert": True},
+    "CLP": {"fred": "IR3TIB01CLM156N", "ticker": "USDCLP=X", "invert": True},
+    "ILS": {"fred": "IR3TIB01ILM156N", "ticker": "USDILS=X", "invert": True},
+    "ZAR": {"fred": "IR3TIB01ZAM156N", "ticker": "USDZAR=X", "invert": True},
+}
+
+# G10 + EM (USD appears once, from G10)
+WIDE = {**G10, **EM}
+EM_CCYS = list(EM.keys())
+
 BASE = "USD"  # rates are measured as a differential vs this
 
 

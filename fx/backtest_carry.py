@@ -103,14 +103,22 @@ def run_rank_backtest(asset_ret, score_grid, freq="M", n_long=3, n_short=3,
     score_grid and asset_ret must be on the same grid; the score must already
     be no-look-ahead (formed from info known before the return period).
     """
+    # cost_bps may be a scalar OR a per-currency Series/dict (majors ~5bps,
+    # EM ~30bps). Per-currency charges each leg's turnover at its own spread.
+    cost_vec = None
+    if not np.isscalar(cost_bps):
+        cost_vec = pd.Series(cost_bps).reindex(asset_ret.columns).fillna(5.0)
+
     dates = asset_ret.index
     prev_w = pd.Series(0.0, index=asset_ret.columns)
     rows = {}
     for dt in dates:
         w = carry_weights(score_grid.loc[dt], n_long, n_short, gross)
         w = w.reindex(asset_ret.columns).fillna(0.0)
-        turnover = (w - prev_w).abs().sum()
-        cost = turnover * cost_bps / 1e4
+        dw = (w - prev_w).abs()
+        turnover = dw.sum()
+        cost = (float((dw * cost_vec).sum()) if cost_vec is not None
+                else turnover * cost_bps) / 1e4
         gross_ret = float((w * asset_ret.loc[dt].fillna(0.0)).sum())
         rows[dt] = (gross_ret, gross_ret - cost, turnover)
         prev_w = w

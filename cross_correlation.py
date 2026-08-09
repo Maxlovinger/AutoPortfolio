@@ -207,6 +207,169 @@ def _svol(r):
     return stats(_scale_to_vol(r))["sharpe"]
 
 
+# --- Markowitz: equity & carry as two "stocks" -----------------------------
+def markowitz_sleeve(start="2010-01-01", rf=0.04):
+    """Mean-variance optimize the allocation between the equity book and plain
+    carry, treated as two assets. Long-only, fully invested. Saves a frontier +
+    Sharpe-vs-weight figure and returns the optimal weights."""
+    import markowitz as mk
+    os.makedirs(OUT, exist_ok=True)
+    eq = equity_monthly()
+    carry, _ = currency_monthly(start=start)
+    df = pd.concat([eq, carry], axis=1).dropna()
+    df.columns = ["equity", "carry"]
+
+    mu = df.mean().values * PPY                          # annualized mean
+    Sig = df.cov().values * PPY                          # annualized covariance
+    w_ms = mk.max_sharpe(mu, Sig, rf=rf)                 # tangency (long-only)
+    w_mv = mk.min_variance(Sig)
+    vols, rets, _ = mk.efficient_frontier(mu, Sig, n_points=60)
+
+    # Sharpe as a function of equity weight (long-only 0..1)
+    ws = np.linspace(0, 1, 101)
+    def _stat(w):
+        wv = np.array([w, 1 - w])
+        return mk.portfolio_vol(wv, Sig), mk.portfolio_return(wv, mu), \
+               mk.sharpe_ratio(wv, mu, Sig, rf)
+    curve = np.array([_stat(w) for w in ws])             # cols: vol, ret, sharpe
+    w_best = ws[curve[:, 2].argmax()]
+
+    fig, ax = plt.subplots(1, 2, figsize=(15, 6))
+    fig.suptitle("Markowitz: equity book vs plain carry as two assets "
+                 f"(annualized, rf={rf:.0%})", fontsize=14, fontweight="bold")
+
+    # (left) efficient frontier + key portfolios
+    a = ax[0]
+    sc = a.scatter(vols, rets, c=(rets - rf) / vols, cmap="viridis", s=18)
+    fig.colorbar(sc, ax=a, label="Sharpe")
+    pts = {"100% equity": (np.sqrt(Sig[0, 0]), mu[0], "C0"),
+           "100% carry": (np.sqrt(Sig[1, 1]), mu[1], "C1"),
+           "max-Sharpe": (mk.portfolio_vol(w_ms, Sig), mk.portfolio_return(w_ms, mu), "red"),
+           "min-var": (mk.portfolio_vol(w_mv, Sig), mk.portfolio_return(w_mv, mu), "k")}
+    for name, (v, r, c) in pts.items():
+        marker = "*" if name == "max-Sharpe" else ("D" if name == "min-var" else "o")
+        a.scatter(v, r, s=180 if marker == "*" else 90, c=c, marker=marker,
+                  edgecolor="k", zorder=5, label=name)
+    # capital market line through tangency
+    tv, tr = pts["max-Sharpe"][0], pts["max-Sharpe"][1]
+    xs = np.linspace(0, max(vols) * 1.05, 20)
+    a.plot(xs, rf + (tr - rf) / tv * xs, "r--", lw=1, alpha=.6, label="CML")
+    a.set_xlabel("annualized volatility"); a.set_ylabel("annualized return")
+    a.set_title("Efficient frontier"); a.legend(fontsize=9); a.grid(alpha=.3)
+
+    # (right) Sharpe vs equity weight
+    a = ax[1]
+    a.plot(ws * 100, curve[:, 2], color="C4")
+    a.axvline(w_best * 100, color="red", ls="--",
+              label=f"max-Sharpe @ {w_best*100:.0f}% equity")
+    a.scatter([0, 100], [curve[0, 2], curve[-1, 2]], c=["C1", "C0"], zorder=5)
+    a.set_xlabel("% in equity (rest in carry)"); a.set_ylabel("portfolio Sharpe")
+    a.set_title("Sharpe vs allocation"); a.legend(fontsize=9); a.grid(alpha=.3)
+
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
+    p = os.path.join(OUT, "markowitz_two_sleeve.png")
+    fig.savefig(p, dpi=130); plt.close(fig)
+
+    return {"max_sharpe_w": {"equity": w_ms[0], "carry": w_ms[1]},
+            "min_var_w": {"equity": w_mv[0], "carry": w_mv[1]},
+            "max_sharpe_ratio": mk.sharpe_ratio(w_ms, mu, Sig, rf),
+            "equity_sharpe": (mu[0] - rf) / np.sqrt(Sig[0, 0]),
+            "carry_sharpe": (mu[1] - rf) / np.sqrt(Sig[1, 1]),
+            "mu": mu, "path": p}
+
+
+def _load_retry(uni, start="2010-01-01"):
+    from fx.data import load_all
+    import time
+    for _ in range(4):
+        try:
+            return load_all(start=start, universe=uni)
+        except Exception:
+            time.sleep(4)
+    raise RuntimeError("FRED load failed")
+
+
+def make_wide_figure(start="2010-01-01", rf=0.04, em_bps=30.0):
+    """Visual: does widening the FX universe to EM earn carry a real allocation?
+    G10 carry vs EM-widened carry — growth, cost sensitivity, tail cost, and the
+    levered Markowitz allocation flip."""
+    import markowitz as mk
+    from fx.data import G10, WIDE, EM_CCYS
+    from fx.backtest_carry import run_carry_backtest, summarize
+    os.makedirs(OUT, exist_ok=True)
+
+    g = _load_retry(G10, start); w = _load_retry(WIDE, start)
+    g10 = run_carry_backtest(g["spot"], g["carry"], n_long=3, n_short=3, cost_bps=5.0)
+    costs = {c: (em_bps if c in EM_CCYS else 5.0) for c in w["carry"].columns}
+    wide = run_carry_backtest(w["spot"], w["carry"], n_long=3, n_short=3, cost_bps=costs)
+    mg, mw = summarize(g10), summarize(wide)
+
+    # levered Markowitz allocation (carry scaled to equity vol) for G10 & WIDE
+    eq = equity_monthly()
+    def tangency(carry_net):
+        c = carry_net.copy(); c.index = c.index + pd.offsets.MonthEnd(0)
+        d = pd.concat([eq, c], axis=1).dropna(); d.columns = ["eq", "c"]
+        d["c"] *= d["eq"].std() / d["c"].std()               # lever to equity vol
+        mu = d.mean().values * PPY; Sig = d.cov().values * PPY
+        wt = mk.max_sharpe(mu, Sig, rf=rf)
+        return wt[1], mk.sharpe_ratio(wt, mu, Sig, rf), d.corr().iloc[0, 1]
+    wc_g, sh_g, rho_g = tangency(g10["net_ret"])
+    wc_w, sh_w, rho_w = tangency(wide["net_ret"])
+    eq_sharpe = (eq.mean() * PPY - rf) / (eq.std() * np.sqrt(PPY))
+
+    fig, ax = plt.subplots(2, 2, figsize=(15, 11))
+    fig.suptitle("Widening the FX carry universe to EM", fontsize=15, fontweight="bold")
+
+    a = ax[0, 0]
+    a.plot((1 + g10["net_ret"]).cumprod(), label=f"G10 carry (Sharpe {mg['sharpe']:.2f})")
+    a.plot((1 + wide["net_ret"]).cumprod(), label=f"G10+EM carry (Sharpe {mw['sharpe']:.2f})")
+    a.set_title("Growth of $1 (unlevered)"); a.legend(); a.grid(alpha=.3)
+
+    a = ax[0, 1]
+    bpss = [5, 15, 30, 50]
+    shs = []
+    for b in bpss:
+        cc_ = {c: (b if c in EM_CCYS else 5.0) for c in w["carry"].columns}
+        shs.append(summarize(run_carry_backtest(w["spot"], w["carry"], n_long=3,
+                    n_short=3, cost_bps=cc_))["sharpe"])
+    a.plot(bpss, shs, "o-", label="G10+EM carry")
+    a.axhline(mg["sharpe"], color="C1", ls="--", label=f"G10 = {mg['sharpe']:.2f}")
+    a.axhline(0.34, color="k", ls=":", label="MV threshold ~0.34")
+    a.set_xlabel("EM half-spread (bps)"); a.set_ylabel("Sharpe")
+    a.set_title("Cost sensitivity (robust)"); a.legend(fontsize=9); a.grid(alpha=.3)
+
+    a = ax[1, 0]
+    labs = ["G10", "G10+EM"]
+    a.bar(labs, [mg["skew"], mw["skew"]], color=["C0", "C1"])
+    a.set_title("Skew — the EM tail cost"); a.grid(alpha=.3, axis="y")
+    for i, v in enumerate([mg["skew"], mw["skew"]]):
+        a.text(i, v, f"{v:.2f}", ha="center", va="top" if v < 0 else "bottom")
+
+    a = ax[1, 1]; a.axis("off")
+    txt = (
+        f"LEVERED MARKOWITZ (carry @ equity vol, rf={rf:.0%})\n\n"
+        f"{'universe':<10}{'Sharpe':>7}{'corr':>7}{'carry wt':>10}{'blend Sh':>10}\n"
+        f"{'G10':<10}{mg['sharpe']:>7.2f}{rho_g:>7.2f}{wc_g*100:>9.0f}%{sh_g:>10.2f}\n"
+        f"{'G10+EM':<10}{mw['sharpe']:>7.2f}{rho_w:>7.2f}{wc_w*100:>9.0f}%{sh_w:>10.2f}\n"
+        f"{'equity':<10}{'':>7}{'':>7}{'--':>10}{eq_sharpe:>10.2f}\n\n"
+        f"WIDENING FLIPS THE VERDICT:\n"
+        f" - Sharpe {mg['sharpe']:.2f} -> {mw['sharpe']:.2f} (bigger EM rate diffs)\n"
+        f" - corr {rho_g:.2f} -> {rho_w:.2f} (EM less equity-linked)\n"
+        f" - Markowitz carry weight {wc_g*100:.0f}% -> {wc_w*100:.0f}%\n"
+        f" - combined Sharpe {eq_sharpe:.2f} -> {sh_w:.2f}\n\n"
+        f"CAVEAT: skew {mg['skew']:.2f} -> {mw['skew']:.2f} (EM devaluation\n"
+        f"jumps). Mean-variance IGNORES this fatter left\n"
+        f"tail, so a skew-aware investor sizes EM carry\n"
+        f"BELOW the {wc_w*100:.0f}% MV weight. Robust to EM costs."
+    )
+    a.text(0.02, 0.98, txt, va="top", family="monospace", fontsize=10.5)
+
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    p = os.path.join(OUT, "wide_carry.png")
+    fig.savefig(p, dpi=130); plt.close(fig)
+    return p
+
+
 if __name__ == "__main__":
     df, corr, path = make_dashboard()
     print(f"\nOverlap: {df.index[0]:%Y-%m} .. {df.index[-1]:%Y-%m}  ({len(df)} months)")

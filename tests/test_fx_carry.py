@@ -134,6 +134,30 @@ def test_costs_reduce_return_when_book_turns_over():
     assert charged["equity"].iloc[-1] < free["equity"].iloc[-1]
 
 
+def test_per_currency_costs_charge_more_for_em():
+    # a per-currency cost dict must charge each leg its own spread; higher EM
+    # costs -> lower net return than uniform-low costs
+    spot, carry = make_varying_carry()
+    cheap = bc.run_carry_backtest(spot, carry, freq="M", n_long=2, n_short=2,
+                                  cost_bps=5.0)
+    # make two of the names "EM" with a 50bps spread
+    percc = {c: (50.0 if c in ("AAA", "EEE") else 5.0) for c in carry.columns}
+    pricey = bc.run_carry_backtest(spot, carry, freq="M", n_long=2, n_short=2,
+                                   cost_bps=percc)
+    assert pricey["turnover"].sum() > 0
+    assert pricey["equity"].iloc[-1] < cheap["equity"].iloc[-1]
+
+
+def test_wide_universe_structure():
+    from fx.data import G10, EM, WIDE, EM_CCYS
+    assert set(WIDE) == set(G10) | set(EM)
+    assert list(WIDE).count("USD") == 1            # USD only once
+    assert set(EM_CCYS) == set(EM) and "USD" not in EM_CCYS
+    # every EM entry has a fred series + invert flag (all USD-per-foreign)
+    for c, cfg in EM.items():
+        assert cfg["fred"] and cfg["ticker"] and cfg["invert"] is True
+
+
 def test_weekly_signal_does_not_inflate_turnover_for_monthly_carry():
     # KEY finding: carry updates monthly, so weekly rebalancing recomputes the
     # same forward-filled signal intra-month -> weights don't churn between
