@@ -102,6 +102,46 @@ def curve_panels(raw: pd.DataFrame | None = None):
     return front, second
 
 
+def front_returns(raw: pd.DataFrame | None = None, clip=0.40) -> pd.DataFrame:
+    """
+    CLEAN monthly front-contract returns that INCLUDE the roll yield.
+
+    Raw continuous (.n.0) prices jump at each roll (instrument switch); a naive
+    pct_change would book that gap as a spurious return and, crucially, MISS the
+    roll yield (the thing carry earns). We instead take WITHIN-contract daily
+    returns (which include each contract's convergence toward spot = the roll
+    yield) and DROP the roll-day cross-contract gap, detected via a change in
+    `instrument_id`. Then compound daily -> monthly.
+
+    Robustness: returns spanning a NON-POSITIVE price (e.g. the Apr-2020 negative
+    WTI settlement) are invalid under pct_change and are dropped; daily returns are
+    winsorized to +/-`clip` to kill data glitches (a real futures day rarely moves
+    >40%). Without these guards a single bad print corrupts the whole backtest.
+    """
+    raw = raw if raw is not None else pd.read_pickle(RAW_CACHE)
+    df = raw.reset_index()
+    sym = df["symbol"].astype(str)
+    df = df[sym.str.rsplit(".", n=1).str[-1] == "0"].copy()        # front only
+    df["root"] = sym[df.index].str.split(".").str[0]
+    root2name = {v: k for k, v in ROOTS.items()}
+    df["market"] = df["root"].map(root2name)
+    tcol = "ts_event" if "ts_event" in df.columns else raw.index.name or "index"
+    df["date"] = pd.to_datetime(df[tcol], utc=True).dt.tz_localize(None).dt.normalize()
+
+    out = {}
+    for mkt, g in df.groupby("market"):
+        g = g.sort_values("date")
+        ret = g["close"].pct_change()
+        rolled = g["instrument_id"].ne(g["instrument_id"].shift(1))
+        bad = (g["close"] <= 0) | (g["close"].shift(1) <= 0)   # non-positive price
+        ret = ret.mask(rolled.values | bad.values)             # drop roll gap + glitches
+        if clip:
+            ret = ret.clip(-clip, clip)                        # winsorize daily glitches
+        out[mkt] = pd.Series(ret.values, index=g["date"].values)
+    daily = pd.DataFrame(out).sort_index()
+    return (1 + daily.fillna(0.0)).resample(MONTH_END).prod() - 1
+
+
 def carry_monthly(front: pd.DataFrame, second: pd.DataFrame) -> pd.DataFrame:
     """
     Monthly TRUE carry = annualized log slope of front vs second contract:

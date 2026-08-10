@@ -96,3 +96,21 @@ def test_universe_has_sectors_and_symbols():
     for name, c in cf.FUTURES.items():
         assert c["symbol"] and c["exchange"] and c["ccy"] == "USD"
         assert c["sector"] in {"energy", "metals", "grains", "softs", "meats"}
+
+
+# --- databento clean front returns (roll-gap handling) ---------------------
+def test_front_returns_skips_roll_gap():
+    import databento_curve as dbc
+    import numpy as np, pandas as pd
+    # one market, two contracts: within-contract move real, roll-day gap spurious
+    dates = pd.to_datetime(["2020-01-02","2020-01-03","2020-01-06","2020-01-07"])
+    raw = pd.DataFrame({
+        "ts_event": dates,
+        "symbol": ["CL.n.0"]*4,
+        "instrument_id": [111,111,222,222],   # roll happens on 3rd row
+        "close": [100.0, 101.0, 80.0, 81.0],  # 101->80 is the roll GAP (not a return)
+    }).set_index("ts_event")
+    m = dbc.front_returns(raw)
+    daily_prod = (1+m.fillna(0)).prod()-1
+    # real returns: +1% (day2) and +1.25% (day4); the -20% roll gap must be excluded
+    assert daily_prod["Oil"] == pytest.approx((1.01*1.0125)-1, rel=1e-6)
