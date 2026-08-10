@@ -38,7 +38,7 @@ CACHE_DIR = os.path.join(os.path.dirname(__file__), ".gdelt_cache")
 # tripping 429s (which otherwise force slow backoffs). Cache hits don't sleep.
 # 3s spacing cut the 429 failure rate materially in testing; rerun to fill gaps
 # (cached names return instantly, only the failed ones retry).
-THROTTLE_SEC = 3.0
+THROTTLE_SEC = 6.0     # GDELT hard limit is 1 request / 5s -> space to 6s or it 429s
 
 # currency -> a SINGLE quoted phrase (GDELT TimelineTone chokes on complex boolean
 # OR queries; single phrases like the equity path work). Central-bank tone is also
@@ -62,7 +62,7 @@ def _cache_path(params: dict) -> str:
     return os.path.join(CACHE_DIR, f"{key}.json")
 
 
-def _fetch(params: dict, retries=3, pause=2.0, use_cache=True,
+def _fetch(params: dict, retries=4, pause=6.0, use_cache=True,
            throttle=THROTTLE_SEC) -> dict:
     """GET the DOC API with backoff + on-disk cache. Raises on repeated failure.
     Cache HITS return immediately (no sleep); after a live fetch we pause
