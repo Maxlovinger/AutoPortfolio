@@ -85,6 +85,18 @@ def stock(symbol: str) -> Contract:
     return c
 
 
+def forex(base: str, quote: str = "USD") -> Contract:
+    """Spot FX contract (IDEALPRO) for the carry sleeve, e.g. forex('EUR') = EUR.USD.
+    Order quantity is in BASE-currency units (not shares). Provided for the FX
+    sleeve; live FX execution is gated behind explicit opt-in (see portfolio_live)."""
+    c = Contract()
+    c.symbol = base
+    c.secType = "CASH"
+    c.currency = quote
+    c.exchange = "IDEALPRO"
+    return c
+
+
 def market_order(action: str, quantity: int) -> Order:
     o = Order()
     o.action = action                 # "BUY" / "SELL"
