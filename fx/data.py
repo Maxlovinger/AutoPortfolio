@@ -20,9 +20,11 @@ Design notes that matter more than the code:
 """
 
 from __future__ import annotations
+import io
 import os
 import numpy as np
 import pandas as pd
+import requests
 import yfinance as yf
 from fredapi import Fred
 
@@ -119,6 +121,67 @@ def carry_base(rates: pd.DataFrame, base=BASE) -> pd.DataFrame:
     """
     diff = rates.sub(rates[base], axis=0)
     return diff.drop(columns=[base])
+
+
+# --- FRESH policy rates (for LIVE trading) ---------------------------------
+# The OECD 3M interbank series above are MONTHLY and LAG 1-7 months — fine for
+# the monthly backtest, too stale to trade on live. For the live carry signal we
+# use central-bank POLICY rates from the BIS (dataflow WS_CBPOL): event-based
+# (they only move on a rate decision, so the last level is always the CURRENT
+# stance), daily, free, and keyless — and covering every currency in WIDE from a
+# single internally-consistent source. Level differs from 3M interbank (no term/
+# credit premium) but the cross-sectional RANKING that carry trades is preserved.
+BIS_CBPOL_URL = ("https://stats.bis.org/api/v2/data/dataflow/BIS/WS_CBPOL/1.0/"
+                 "D.{areas}?{query}&format=csv")
+# currency -> BIS reference-area code (XM = euro area)
+POLICY_AREA = {
+    "USD": "US", "EUR": "XM", "GBP": "GB", "JPY": "JP", "CHF": "CH", "AUD": "AU",
+    "NZD": "NZ", "CAD": "CA", "SEK": "SE", "NOK": "NO", "MXN": "MX", "PLN": "PL",
+    "CZK": "CZ", "HUF": "HU", "KRW": "KR", "CLP": "CL", "ILS": "IL", "ZAR": "ZA",
+}
+
+
+def parse_cbpol(csv_text: str, area_to_ccy: dict) -> pd.DataFrame:
+    """Parse a BIS CBPOL SDMX-CSV response into a wide daily policy-rate frame
+    (one column per currency, %). Policy rates are step functions, so the frame
+    is forward-filled: the last decided level persists until the next decision.
+    Pure (no I/O) so it's unit-tested against canned CSV."""
+    df = pd.read_csv(io.StringIO(csv_text))
+    df = df[df["REF_AREA"].isin(area_to_ccy)].copy()
+    df["ccy"] = df["REF_AREA"].map(area_to_ccy)
+    df["date"] = pd.to_datetime(df["TIME_PERIOD"])
+    wide = df.pivot_table(index="date", columns="ccy", values="OBS_VALUE")
+    return wide.sort_index().ffill()
+
+
+def fetch_policy_rates(universe=G10, start=None, timeout=60) -> pd.DataFrame:
+    """
+    Current central-bank policy rate (%) per currency from BIS CBPOL. Returns a
+    wide daily DataFrame, forward-filled, so `.iloc[-1]` is a complete, FRESH
+    cross-section. `start` (YYYY-MM-DD) pulls history; default = latest obs only.
+    """
+    area_to_ccy = {POLICY_AREA[c]: c for c in universe if c in POLICY_AREA}
+    if not area_to_ccy:
+        raise ValueError("no currencies in `universe` map to a BIS policy area")
+    query = f"startPeriod={start}" if start else "lastNObservations=1"
+    url = BIS_CBPOL_URL.format(areas="+".join(area_to_ccy), query=query)
+    r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=timeout)
+    r.raise_for_status()
+    return parse_cbpol(r.text, area_to_ccy)
+
+
+def policy_carry(rate_row: pd.Series, base=BASE) -> pd.Series:
+    """Carry base (%) from ONE cross-section of policy rates: foreign - USD, with
+    the base currency (~0) dropped. Same orientation/units as carry_base, so it
+    plugs straight into carry_weights / fx_sleeve_targets. Pure + tested."""
+    diff = rate_row - rate_row.get(base, 0.0)
+    return diff.drop(labels=[base], errors="ignore").dropna()
+
+
+def fresh_carry(universe=WIDE) -> pd.Series:
+    """The FRESH carry row to feed the LIVE FX sleeve: latest BIS policy-rate
+    differential vs USD (%), one entry per tradeable foreign currency."""
+    return policy_carry(fetch_policy_rates(universe).iloc[-1])
 
 
 # --- Spot FX ---------------------------------------------------------------
