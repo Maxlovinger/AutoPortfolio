@@ -97,11 +97,15 @@ def forex(base: str, quote: str = "USD") -> Contract:
     return c
 
 
-def market_order(action: str, quantity: int) -> Order:
+def market_order(action: str, quantity: int, tif: str = "DAY") -> Order:
+    """MKT order. tif='DAY' (default, expires at close) or 'GTC' (Good-Till-Cancelled,
+    persists across sessions until filled/cancelled). FX odd-lots use GTC so an
+    unfilled leg keeps working the next session instead of expiring overnight."""
     o = Order()
     o.action = action                 # "BUY" / "SELL"
     o.orderType = "MKT"
     o.totalQuantity = quantity
+    o.tif = tif
     # these default True in some ibapi builds and get rejected by TWS
     for attr in ("eTradeOnly", "firmQuoteOnly"):
         if hasattr(o, attr):

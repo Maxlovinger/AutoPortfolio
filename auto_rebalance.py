@@ -1,12 +1,20 @@
 """
-auto_rebalance.py — the scheduled, automated live job for the LOCKED strategy.
+auto_rebalance.py — the scheduled, automated live job for the STOCK + BOND sleeves
+of the 3-sleeve book (the CURRENCY sleeve runs separately in run_fx.py).
 
-WHAT IT RUNS (see final_strategy.py / report.md for the full research trail):
-  * Holdings: the 30 most-liquid eligible names, <=5 per sector, EQUAL WEIGHT.
-  * Holdings rebalance cadence: QUARTERLY (~63 trading days).
-  * Exposure overlay: 15% annual VOLATILITY TARGET, managed WEEKLY with a +/-10%
-    no-trade band (the cadence that matched daily-continuous at half the turnover;
-    quarterly-only exposure was proven useless — it left drawdowns at -34%).
+WHAT IT RUNS (see final_strategy.py / portfolio_live.py for the full trail):
+  * Equity: the 30 most-liquid eligible names, <=5 per sector, EQUAL WEIGHT, held at
+    the 63.9% equity sleeve weight * vol-target exposure. Rebalanced QUARTERLY.
+  * Bonds: IEF at a fixed 10% sleeve weight (rebalanced whenever this job runs).
+  * Exposure overlay: 15% annual VOLATILITY TARGET on the equity slice, managed
+    WEEKLY with a +/-10% no-trade band (matched daily-continuous at half the turnover;
+    quarterly-only exposure was proven useless — it left drawdowns at -34%). The
+    de-risked equity slice goes to CASH by design (routing it elsewhere lost).
+  * Cash-deploy top-up: after whole-share flooring, a largest-remainder top-up
+    deploys the rounding drag so equity+IEF actually reach their design weights.
+
+Together with run_fx.py (currency 26.1%), this holds the full design allocation:
+equity 63.9%*exp + currency 26.1% + bonds 10%, cash = de-risked equity slice.
 
 WHY IT LOGS RATIONALE
   Because it runs unattended, every decision is written to decision_log.md (human
@@ -32,11 +40,11 @@ LOG_MD = "decision_log.md"
 LOG_JSONL = "decision_log.jsonl"
 
 # ---- LOCKED PARAMETERS (mirror final_strategy.py) ----
-TRADE_CAPITAL = None         # None = deploy the FULL account NAV (100% invested,
-                             # no structurally idle cash). Set to a $ number to
-                             # instead cap deployment and leave the rest in cash.
-                             # We reset the paper account to a small balance in
-                             # Client Portal, so full-NAV == the whole ~$40k book.
+TRADE_CAPITAL = None         # None = size against the FULL account NAV. Deployment
+                             # is governed by the 3-sleeve DESIGN WEIGHTS (equity
+                             # 63.9%*exposure + IEF 10%), NOT 100% — the currency
+                             # sleeve (26.1%) and the vol-target de-risked slice are
+                             # the rest. Set to a $ number only to cap the book.
 BASKET_N = 30
 MAX_PER_SECTOR = 5
 TARGET_VOL = 0.15
@@ -194,9 +202,15 @@ def run(kind="sim", dry_run=True, port=7497, today=None, verbose=True, moo=False
             print(f"[{today.date()}] nothing scheduled (not a Monday or quarter-end).")
         return None
 
-    # ---- live prices for the most-liquid candidates ----
+    # 3-sleeve design sizing (equity 63.9%*exposure + IEF 10%; currency is a
+    # separate margin sleeve run by run_fx.py) + cash-deployment top-up.
+    from portfolio_live import (BOND_ETF, stock_sleeve_weights,
+                                greedy_share_topup, merge_share_orders)
+
+    # ---- live prices for the most-liquid candidates (+ the IEF bond sleeve) ----
     candidates = adv.sort_values(ascending=False).head(N_CANDIDATES).index.tolist()
-    prices = download_prices(candidates, start=str((today - pd.Timedelta(days=400)).date()))
+    prices = download_prices(candidates + [BOND_ETF],
+                             start=str((today - pd.Timedelta(days=400)).date()))
     if prices is None or prices.shape[1] == 0:
         raise RuntimeError("No live prices (yfinance issue). Retry shortly.")
     latest = prices.iloc[-1]
@@ -236,7 +250,13 @@ def run(kind="sim", dry_run=True, port=7497, today=None, verbose=True, moo=False
     rationale.append("Exposure: " + exp_reason)
     state["held_exposure"] = new_exp
 
-    weights = target_weights(picks, new_exp)
+    # 3-sleeve stock book: equity at 63.9%*exposure (de-risked slice -> cash by
+    # design) PLUS the IEF bond sleeve at a fixed 10%. Currency (26.1%) is a
+    # separate margin sleeve handled by run_fx.py.
+    weights = stock_sleeve_weights(picks, new_exp)
+    rationale.append(f"Stock sleeve target: equity {new_exp*100:.0f}%-exposed at its "
+                     f"63.9% sleeve weight + IEF 10% (gross {weights.sum()*100:.1f}% of NAV; "
+                     f"currency 26.1% runs separately).")
 
     # ---- route orders ----
     broker = make_broker(kind, dry_run=dry_run, port=port)
@@ -256,6 +276,20 @@ def run(kind="sim", dry_run=True, port=7497, today=None, verbose=True, moo=False
             current = normalize_positions(
                 broker._ibkr.positions(broker.app), fractional=fractional)
             orders = _po(weights, latest, nav, current, fractional=fractional)
+            # plan_orders FLOORs each name, leaving the stock sleeve UNDER target with
+            # idle cash. Deploy that rounding drag with a largest-remainder whole-share
+            # top-up so equity+IEF actually reach their design weights (max invested
+            # capital). Skipped for fractional (which already hits target exactly).
+            if not fractional:
+                projected = dict(current)
+                for o in orders:
+                    projected[o["ticker"]] = projected.get(o["ticker"], 0) + o["shares"]
+                tgt = {t: float(weights[t]) * nav for t in weights.index}
+                extra = greedy_share_topup(tgt, projected, latest)
+                if extra:
+                    orders = merge_share_orders(orders, extra, latest)
+                    rationale.append(f"Cash-deploy top-up into {len(extra)} name(s) to "
+                                     f"reach design weights: {extra}")
             if fractional and moo:
                 moo = False             # fractional shares aren't allowed on OPG
                 rationale.append("Fractional mode: using regular MKT orders "

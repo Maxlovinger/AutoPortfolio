@@ -119,8 +119,8 @@ class _FakeIbkr:
     def forex(self, base, quote="USD"):
         return (base, quote)
 
-    def market_order(self, action, qty):
-        return (action, qty)
+    def market_order(self, action, qty, tif="DAY"):
+        return (action, qty, tif)
 
 
 def test_route_fx_dry_run_sends_nothing():
@@ -143,3 +143,22 @@ def test_route_fx_live_sends_tradeable_only():
     assert "KRW" not in sent                                # NDF never transmitted
     krw = next(l for l in plan if l["ccy"] == "KRW")
     assert krw["status"] == "SKIPPED-NDF"
+
+
+def test_route_fx_uses_gtc():
+    """FX legs must be GTC so an unfilled odd-lot persists instead of expiring at close."""
+    plan = fxe.fx_order_plan({"MXN": 5_000, "CHF": -5_000}, _spot())
+    app = _FakeApp()
+    fxe.route_fx(app, plan, _FakeIbkr(), dry_run=False)
+    assert app.placed, "expected orders to be sent"
+    tifs = {order[2] for (_, _, order) in app.placed}      # order = (action, qty, tif)
+    assert tifs == {"GTC"}
+
+
+def test_market_order_tif_default_day_and_gtc():
+    """Equity path stays DAY (default); explicit GTC is honored (FX)."""
+    import ibkr
+    assert ibkr.market_order("BUY", 100).tif == "DAY"
+    assert ibkr.market_order("SELL", 100, tif="GTC").tif == "GTC"
+    # market-on-open still overrides to OPG on top of market_order
+    assert ibkr.market_on_open_order("BUY", 100).tif == "OPG"

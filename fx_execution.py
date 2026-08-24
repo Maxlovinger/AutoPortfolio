@@ -176,7 +176,10 @@ def route_fx(app, plan: list[dict], ibkr, dry_run=True, wait=25) -> list[dict]:
     for l in sendable:
         oid = app.next_order_id()
         contract = ibkr.forex(l["base"], l["quote"])
-        order = ibkr.market_order(l["action"], l["qty"])
+        # GTC: FX legs are odd-lots (< IDEALPRO $25k min) that often don't fill the
+        # same session; DAY would expire them overnight (the book vanished this way).
+        # GTC keeps an unfilled leg working until it fills, so the book converges.
+        order = ibkr.market_order(l["action"], l["qty"], tif="GTC")
         app.placeOrder(oid, contract, order)
         l["order_id"] = oid
         oids.append(oid)
