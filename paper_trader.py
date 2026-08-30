@@ -167,6 +167,48 @@ def plan_orders(weights: pd.Series, prices: pd.Series, nav: float,
 
 
 # ----------------------------------------------------------------------
+# Pre-trade safety guard (pure, testable)
+# ----------------------------------------------------------------------
+class TradingHalt(RuntimeError):
+    """Raised to ABORT a run before any order is planned/transmitted, when the
+    account feed can't be trusted. NEVER size orders against an unverified NAV."""
+
+
+def check_tradeable(nav, current, expected_holdings, error_codes=()) -> None:
+    """Refuse to trade unless the live account picture is trustworthy.
+
+    The failure this exists to prevent: a transient IB gateway disconnect makes
+    account_summary() time out and nav() return its 0.0 default. Sizing orders
+    against nav=0 makes every target 0 shares -> SELL-the-entire-book, which
+    would then be transmitted live. Three independent tripwires:
+
+      1. hard connectivity-loss code (1100/2110) seen this run -> feed is down.
+      2. nav is not a finite positive number -> account summary didn't arrive.
+      3. we believe we hold positions (state has last_holdings) but the broker
+         reported none -> the positions feed is degraded/stale; trading now
+         would churn the whole book against a phantom-empty portfolio.
+
+    Raises TradingHalt on any trip. `current` is the normalized {ticker: qty}
+    from the broker; `expected_holdings` is state['last_holdings'] (or []).
+    """
+    from ibkr import is_connection_lost
+    if is_connection_lost(error_codes):
+        broken = [c for c in error_codes
+                  if (c[1] if isinstance(c, (tuple, list)) else c) in {1100, 2110}]
+        raise TradingHalt(f"IB connectivity lost this run ({broken}); "
+                          f"refusing to route orders against a stale feed.")
+    if nav is None or not np.isfinite(nav) or nav <= 0:
+        raise TradingHalt(f"NAV unreadable (nav={nav!r}); account summary did not "
+                          f"arrive — refusing to size orders against a $0 NAV.")
+    held = {t for t, q in (current or {}).items() if q}
+    if expected_holdings and not held:
+        raise TradingHalt(
+            f"positions feed returned empty while state expects "
+            f"{len(expected_holdings)} holdings; refusing to trade against a "
+            f"phantom-empty portfolio.")
+
+
+# ----------------------------------------------------------------------
 # IBKR backend (real paper orders) — via IB's official ibapi (ibkr.py)
 # ----------------------------------------------------------------------
 class IBKRBroker:

@@ -1,0 +1,44 @@
+# Raspberry Pi deployment (live IB Gateway)
+
+These are the operational scripts that run the auto-portfolio live on the pi
+(`ssh pi`). They live on the pi at `/home/maxlovinger/autoPortfolio/` alongside
+the Python code; this folder is the version-controlled source of truth.
+
+## Layout on the pi
+- `/home/maxlovinger/autoPortfolio/` — Python code + these scripts + `.venv`
+- `/home/maxlovinger/ib-gateway/` — `docker-compose.yml` for the `ib-gateway`
+  container (IBC + IB Gateway 10.x). Maps host `127.0.0.1:4002` -> container API.
+
+## Scripts
+| Script | Role |
+|---|---|
+| `ensure_gateway.sh` | Verify gateway is logged in (NAV readable) **at trade time**; restart container + re-check up to 3x. Sourced by the trade jobs so they never trade against a broken feed. |
+| `run_pi.sh` | Weekly/quarterly STOCK+BOND rebalance (`auto_rebalance.py --ibkr --gateway --live`). Guards via `ensure_gateway.sh`. |
+| `run_fx_pi.sh` | FX carry sleeve (`run_fx.py --live --gateway`). Guards via `ensure_gateway.sh`. |
+| `gateway_health.py` | Read-only probe: exit 0 if NAV readable, else 1. |
+| `gateway_health.sh` | Intraday auto-heal / warm-up cron wrapper around the probe. |
+| `run_snapshot_pi.sh` | Daily NAV snapshot email. |
+
+## Safety model (two independent layers)
+1. **Operational** — `ensure_gateway.sh` confirms the gateway is logged in
+   immediately before each trade job (closes the gap between the 09:45 health
+   cron and the 10:00 trade).
+2. **In-code** — `auto_rebalance.check_tradeable()` (raises `TradingHalt`) and
+   `run_fx` abort if NAV is `<= 0`, positions come back phantom-empty, or a hard
+   connectivity-loss code (1100/2110) is seen. Nothing is transmitted on a trip.
+
+## Crontab (unchanged times; scripts now self-guard)
+```
+0 10 * * 1-5   /home/maxlovinger/autoPortfolio/run_pi.sh          # rebalance 10:00 ET
+15 10 1-7 * 1  /home/maxlovinger/autoPortfolio/run_fx_pi.sh       # FX carry (Mondays / month start)
+5 17 * * *     /home/maxlovinger/autoPortfolio/run_snapshot_pi.sh # daily snapshot email
+45 9 * * 1-5   /home/maxlovinger/autoPortfolio/gateway_health.sh  # warm-up
+0 13 * * 1-5   /home/maxlovinger/autoPortfolio/gateway_health.sh  # intraday heal
+```
+
+## Deploy
+Copy changed files to the pi, then re-check perms:
+```
+scp deploy/*.sh deploy/gateway_health.py pi:/home/maxlovinger/autoPortfolio/
+ssh pi 'chmod +x /home/maxlovinger/autoPortfolio/*.sh'
+```

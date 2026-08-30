@@ -25,6 +25,23 @@ from ibapi.order import Order
 # benign "connection ok / market-data farm" notices, not real errors
 INFO_CODES = {2104, 2106, 2107, 2108, 2119, 2158, 2100, 2150}
 
+# HARD connectivity-loss codes: the socket to IB's servers is down, so any
+# account/position read is stale-or-empty and any order we route may be dropped
+# or filled against a phantom picture. A run that sees one of these MUST NOT
+# transmit. (1100 = connectivity lost; 2110 = TWS<->server broken. Both are the
+# ones that appeared in the field when the scheduled rebalance read NAV $0.)
+CONNECTION_LOST_CODES = {1100, 2110}
+
+
+def is_connection_lost(codes) -> bool:
+    """True if any hard connectivity-loss code is present. `codes` may be an
+    iterable of raw int codes or of (level, code, text) message tuples."""
+    for c in codes:
+        code = c[1] if isinstance(c, (tuple, list)) else c
+        if code in CONNECTION_LOST_CODES:
+            return True
+    return False
+
 
 class IBKRClient(EWrapper, EClient):
     def __init__(self):

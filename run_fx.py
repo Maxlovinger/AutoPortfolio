@@ -90,10 +90,13 @@ class App(EWrapper, EClient):
         self._next = None; self._idev = threading.Event()
         self.nlv = None; self.raw_fx = []      # (symbol, currency, position) for held CASH
         self.order_status = {}; self.acctdone = False; self.posdone = False
+        self.conn_lost = False                 # set on a hard connectivity-loss code
     def nextValidId(self, oid): self._next = oid; self._idev.set()
     def next_order_id(self):
         o = self._next; self._next += 1; return o
     def error(self, reqId, code="", msg="", *a):
+        if code in ibkr_mod.CONNECTION_LOST_CODES:
+            self.conn_lost = True
         if code not in INFO: log(f"IB msg {code}: {msg}")
     def updateAccountValue(self, k, v, cur, acct):
         if k == "NetLiquidation" and cur in ("USD", "BASE"):
@@ -124,6 +127,13 @@ def main():
         nav = app.nlv or 0.0
         if nav <= 0:
             log("ABORT: could not read NAV."); return
+        # A stale-but-positive NAV can survive a broken gateway (this happened
+        # 2026-08-24: NAV read $49,970 yet 0/6 legs acknowledged). Refuse to
+        # transmit into a down socket regardless of what NAV came back.
+        if app.conn_lost:
+            log("ABORT: IB connectivity lost this run (1100/2110); "
+                "refusing to transmit FX orders against a broken gateway.")
+            return
 
         d = load_all(start="2015-01-01", universe=WIDE)
         spot_row = d["spot"].iloc[-1]
@@ -154,8 +164,19 @@ def main():
         if not plan:
             log("Book already on target — no FX orders needed."); return
         fxe.route_fx(app, plan, ibkr_mod, dry_run=False)
-        acks = sum(1 for l in plan if l.get("status") not in (None, "UNCONFIRMED", "DRY-RUN", "SKIPPED-NDF"))
-        log(f"FX sleeve TRANSMITTED: {acks}/{len([l for l in plan if l['tradeable']])} legs acknowledged.")
+        tradeable = [l for l in plan if l["tradeable"]]
+        # "acknowledged" only means TWS accepted the order; it is NOT a fill.
+        # Report fills separately so a run that submits-but-never-fills (the
+        # symptom behind the empty FX sleeve) is visible in the log/email.
+        acked = [l for l in tradeable
+                 if l.get("status") not in (None, "UNCONFIRMED", "DRY-RUN")]
+        filled = [l for l in tradeable if l.get("status") == "Filled"]
+        log(f"FX sleeve TRANSMITTED: {len(acked)}/{len(tradeable)} legs acknowledged, "
+            f"{len(filled)}/{len(tradeable)} FILLED "
+            f"(statuses: { {l['base']+'.'+l['quote']: l.get('status') for l in tradeable} }).")
+        if len(filled) < len(tradeable):
+            log("WARNING: not all FX legs filled — GTC legs keep working; "
+                "verify positions next session (sleeve stays under target until then).")
     finally:
         try: app.disconnect()
         except Exception: pass

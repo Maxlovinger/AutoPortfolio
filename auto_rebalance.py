@@ -187,7 +187,7 @@ def run(kind="sim", dry_run=True, port=7497, today=None, verbose=True, moo=False
     from data import download_prices
     from sector_select import load_sectors, load_names
     from costs import load_adv
-    from paper_trader import plan_orders, make_broker
+    from paper_trader import plan_orders, make_broker, check_tradeable
 
     today = pd.Timestamp(today or dt.date.today())
     state = load_state()
@@ -275,6 +275,11 @@ def run(kind="sim", dry_run=True, port=7497, today=None, verbose=True, moo=False
             # reconcile against targets — see normalize_positions().
             current = normalize_positions(
                 broker._ibkr.positions(broker.app), fractional=fractional)
+            # SAFETY: never plan/route orders against an untrusted account feed.
+            # Aborts on nav<=0, a phantom-empty positions read, or a hard
+            # connectivity-loss code seen this run (see check_tradeable).
+            check_tradeable(nav, current, state.get("last_holdings", []),
+                            getattr(broker.app, "messages", []))
             orders = _po(weights, latest, nav, current, fractional=fractional)
             # plan_orders FLOORs each name, leaving the stock sleeve UNDER target with
             # idle cash. Deploy that rounding drag with a largest-remainder whole-share
@@ -366,7 +371,15 @@ def main():
     port = 4002 if "--gateway" in sys.argv else 7497
     moo = "--moo" in sys.argv          # Market-on-Open: stage orders for next open
     fractional = "--fractional" in sys.argv   # exact equal weight, no rounding cash drag
-    run(kind=kind, dry_run=dry_run, port=port, moo=moo, fractional=fractional)
+    from paper_trader import TradingHalt
+    try:
+        run(kind=kind, dry_run=dry_run, port=port, moo=moo, fractional=fractional)
+    except TradingHalt as e:
+        # Abort LOUDLY and non-zero: nothing was transmitted. The scheduled
+        # wrapper (run_pi.sh) restarts the gateway; this run is intentionally
+        # skipped rather than trading against a broken feed.
+        print(f"\nTRADING HALTED — no orders sent: {e}")
+        sys.exit(2)
     print("\nUsage: python3 auto_rebalance.py [--ibkr] [--live] [--gateway] [--fractional]")
     print("  default = SimBroker dry-run. --ibkr routes to TWS. --live transmits.")
 
