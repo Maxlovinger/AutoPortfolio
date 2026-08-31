@@ -48,6 +48,34 @@ def test_decide_exposure_missing_vol_holds():
     assert new == 0.7 and changed is False
 
 
+# --- weekly-hold: holdings rebalance quarterly, not every week ---------------
+_ORDERS = [
+    {"ticker": "AAPL", "shares": 1, "action": "BUY", "price": 200.0},
+    {"ticker": "NVDA", "shares": -2, "action": "SELL", "price": 180.0},
+    {"ticker": "IEF", "shares": 3, "action": "BUY", "price": 95.0},
+]
+
+
+def test_weekly_hold_passes_through_when_rebalancing():
+    # quarterly rebalance OR an exposure change -> equity IS allowed to move
+    out = ar.weekly_equity_hold(list(_ORDERS), "IEF", rebalance_equity=True)
+    assert out == _ORDERS
+
+
+def test_weekly_hold_keeps_only_ief_when_flat():
+    rationale = []
+    out = ar.weekly_equity_hold(list(_ORDERS), "IEF", rebalance_equity=False,
+                                rationale=rationale)
+    assert [o["ticker"] for o in out] == ["IEF"]        # equity drift suppressed
+    assert "suppressed 2 equity drift" in rationale[0]
+
+
+def test_weekly_hold_empty_when_no_ief_trade():
+    eq_only = [o for o in _ORDERS if o["ticker"] != "IEF"]
+    out = ar.weekly_equity_hold(eq_only, "IEF", rebalance_equity=False)
+    assert out == []
+
+
 def test_select_book_respects_sector_cap():
     adv = pd.Series({f"T{i}": 100 - i for i in range(30)})
     secs = ["Tech", "Health", "Financials"]

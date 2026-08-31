@@ -94,6 +94,27 @@ def decide_exposure(vol, held, target=TARGET_VOL, band=EXPOSURE_BAND):
             f"band) so NO CHANGE")
 
 
+def weekly_equity_hold(orders, bond_etf, rebalance_equity, rationale=None):
+    """Enforce the QUARTERLY-holdings rule on weekly runs.
+
+    If the equity book is being rebalanced this run (quarterly rebalance, or a
+    vol-target exposure change that scales the whole sleeve), pass orders through
+    unchanged. Otherwise HOLD equity share counts fixed: keep only the bond-sleeve
+    (IEF) trades and drop every equity drift trade. This removes the ~22 tiny
+    re-equal-weight trades that were firing every week against the design intent.
+    """
+    if rebalance_equity:
+        return orders
+    kept = [o for o in orders if o["ticker"] == bond_etf]
+    dropped = len(orders) - len(kept)
+    if rationale is not None:
+        rationale.append(
+            f"Weekly hold: equity share counts unchanged (holdings rebalance "
+            f"quarterly, exposure flat) — suppressed {dropped} equity drift "
+            f"trade(s); only {bond_etf} re-sized to its 10% weight.")
+    return kept
+
+
 def _base_company(name: str) -> str:
     """Collapse a share-class label to its underlying company, so dual-class
     tickers (GOOG/GOOGL 'Alphabet Inc. (Class C/A)', FOX/FOXA, NWS/NWSA) map to
@@ -250,6 +271,13 @@ def run(kind="sim", dry_run=True, port=7497, today=None, verbose=True, moo=False
     rationale.append("Exposure: " + exp_reason)
     state["held_exposure"] = new_exp
 
+    # Holdings rebalance QUARTERLY. The only reason to move equity share counts on
+    # a weekly run is a vol-target exposure change (which deliberately scales the
+    # whole sleeve). Absent that, equity is HELD FIXED — we do NOT drift-correct /
+    # re-equal-weight every week (that was unmodeled turnover, ~22 trades/week).
+    # IEF (the bond sleeve) still rebalances to 10% on every run.
+    rebalance_equity = do_reb or changed
+
     # 3-sleeve stock book: equity at 63.9%*exposure (de-risked slice -> cash by
     # design) PLUS the IEF bond sleeve at a fixed 10%. Currency (26.1%) is a
     # separate margin sleeve handled by run_fx.py.
@@ -281,11 +309,16 @@ def run(kind="sim", dry_run=True, port=7497, today=None, verbose=True, moo=False
             check_tradeable(nav, current, state.get("last_holdings", []),
                             getattr(broker.app, "messages", []))
             orders = _po(weights, latest, nav, current, fractional=fractional)
+            # Weekly hold: unless equity is being rebalanced (quarterly) or re-sized
+            # for an exposure change, drop the equity drift trades and keep only the
+            # bond-sleeve (IEF) rebalance, so equity share counts stay fixed.
+            orders = weekly_equity_hold(orders, BOND_ETF, rebalance_equity, rationale)
             # plan_orders FLOORs each name, leaving the stock sleeve UNDER target with
             # idle cash. Deploy that rounding drag with a largest-remainder whole-share
             # top-up so equity+IEF actually reach their design weights (max invested
-            # capital). Skipped for fractional (which already hits target exactly).
-            if not fractional:
+            # capital). Skipped for fractional (which already hits target exactly) and
+            # on a weekly-hold run (top-up would re-inflate the equity we just froze).
+            if rebalance_equity and not fractional:
                 projected = dict(current)
                 for o in orders:
                     projected[o["ticker"]] = projected.get(o["ticker"], 0) + o["shares"]
