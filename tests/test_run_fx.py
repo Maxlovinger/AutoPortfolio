@@ -63,3 +63,54 @@ def test_roundtrip_establish_then_reconcile_is_flat():
     raw = [("USD", "JPY", 2175.0), ("USD", "HUF", -2175.0)]
     current = run_fx.held_to_signed(raw, SPOT)
     assert run_fx.reconcile_delta(target, current) == {}
+
+
+# --- ledger_to_signed: the reliable source (reqPositions can't see spot-FX) --------
+
+def test_ledger_long_foreign_positive_usd():
+    # +1,042,158 ZAR at 0.0620553 USD/ZAR => LONG ZAR ~ +$64,671
+    cur = run_fx.ledger_to_signed({"ZAR": {"cash": 1042157.82, "rate": 0.0620553}})
+    assert cur["ZAR"] == pytest.approx(64671.0, abs=5)
+
+
+def test_ledger_short_foreign_negative_usd():
+    # -52,289.92 CHF at 1.2352072 USD/CHF => SHORT CHF ~ -$64,589
+    cur = run_fx.ledger_to_signed({"CHF": {"cash": -52289.92, "rate": 1.2352072}})
+    assert cur["CHF"] == pytest.approx(-64589.0, abs=5)
+
+
+def test_ledger_excludes_usd_and_base():
+    led = {"USD": {"cash": 64604.0, "rate": 1.0}, "BASE": {"cash": 64687.0, "rate": 1.0},
+           "ZAR": {"cash": 1000000.0, "rate": 0.062}}
+    assert set(run_fx.ledger_to_signed(led)) == {"ZAR"}
+
+
+def test_ledger_skips_dust_below_band():
+    # accrual dust (0 cash) and a tiny balance are dropped
+    led = {"JPY": {"cash": 0.0, "rate": 0.0062}, "MXN": {"cash": 100.0, "rate": 0.0588}}
+    assert run_fx.ledger_to_signed(led, min_usd=50.0) == {}   # $0 and ~$5.9 both < $50
+
+
+def test_ledger_skips_incomplete_rows():
+    led = {"CHF": {"cash": -52289.92}, "ZAR": {"rate": 0.062}}  # missing rate / cash
+    assert run_fx.ledger_to_signed(led) == {}
+
+
+def test_ledger_reconcile_nets_and_does_not_stack():
+    """Regression for the doubling bug: with the sleeve already held (visible only in
+    the ledger), reconciling against target must UNWIND the excess, not re-add it."""
+    target = {"CHF": -32331.0, "ZAR": 32331.0}                  # 1x sleeve
+    held = {"CHF": {"cash": -52289.92, "rate": 1.2352072},      # ~2x currently held
+            "ZAR": {"cash": 1042157.82, "rate": 0.0620553}}
+    current = run_fx.ledger_to_signed(held)
+    delta = run_fx.reconcile_delta(target, current, min_usd=50.0)
+    # trim back toward 1x: buy CHF (cover part of the short), sell ZAR (cut the long)
+    assert delta["CHF"] > 0 and delta["ZAR"] < 0
+    assert current["CHF"] + delta["CHF"] == pytest.approx(target["CHF"])
+    assert current["ZAR"] + delta["ZAR"] == pytest.approx(target["ZAR"])
+
+
+def test_ledger_flat_book_builds_full_target():
+    """A genuinely flat book (ledger has only USD/BASE) yields current={} so the full
+    target is traded once — the correct behavior the abort-guard protects."""
+    assert run_fx.ledger_to_signed({"USD": {"cash": 100000.0, "rate": 1.0}}) == {}

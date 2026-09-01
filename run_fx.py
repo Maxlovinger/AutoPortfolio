@@ -3,9 +3,11 @@ run_fx.py — FX carry sleeve as a standalone, cron-safe job.
 
 Sizes the dollar-neutral carry book to the currency sleeve weight (26.1% of live NAV)
 using FRESH BIS policy-rate carry, then RECONCILES against currently-held spot-FX:
-each currency's current signed USD exposure is read from the portfolio (marketValue,
-already USD), subtracted from target, and only the DELTA is traded. Idempotent — a
-re-run already on target sends ~nothing (safe to cron monthly; won't stack positions).
+each currency's current signed USD exposure is read from IB's per-currency CASH LEDGER
+($LEDGER-CashBalance × $LEDGER-ExchangeRate — NOT reqPositions, which does not surface
+IDEALPRO spot-FX conversions in this account), subtracted from target, and only the
+DELTA is traded. Idempotent — a re-run already on target sends ~nothing (safe to cron
+monthly; won't stack positions). Aborts if the ledger can't be read (see main()).
 
 Self-contained ibapi app (the shared IBKRClient stores positions as {symbol:qty},
 which loses FX currency/secType — inadequate for netting USD.X pairs). Reuses the
@@ -77,6 +79,32 @@ def held_to_signed(raw_fx, spot_row) -> dict:
     return current
 
 
+def ledger_to_signed(ledger: dict, min_usd=50.0) -> dict:
+    """
+    Signed USD FX exposure per foreign ccy from IB's per-currency cash ledger
+    ({ccy: {"cash":..., "rate":...}}), + = long foreign.
+
+    This is the RELIABLE source: IDEALPRO spot-FX conversions do NOT surface via
+    reqPositions() in this account (verified 2026-08-31 — reqPositions returned 31
+    STK and zero CASH while CHF/ZAR were clearly held), so held_to_signed() below
+    always saw {} and every live rebalance re-stacked the full target on top of the
+    invisible position (the sleeve had doubled to ~$129k gross vs a $64.6k target).
+    The cash ledger ($LEDGER-CashBalance × $LEDGER-ExchangeRate) is authoritative.
+    USD/BASE are the residual base cash, not FX legs, so they're excluded.
+    """
+    current = {}
+    for ccy, d in ledger.items():
+        if ccy in ("USD", "BASE"):
+            continue
+        cash, rate = d.get("cash"), d.get("rate")
+        if cash is None or rate is None:
+            continue
+        usd = cash * rate
+        if abs(usd) >= min_usd:
+            current[ccy] = usd
+    return current
+
+
 def reconcile_delta(target: dict, current: dict, min_usd=50.0) -> dict:
     """Per-currency delta = target - current, dropping legs below min_usd (no-churn band)."""
     ccys = set(target) | set(current)
@@ -89,7 +117,9 @@ class App(EWrapper, EClient):
         EClient.__init__(self, self)
         self._next = None; self._idev = threading.Event()
         self.nlv = None; self.raw_fx = []      # (symbol, currency, position) for held CASH
+        self.ledger = {}                       # ccy -> {"cash":float,"rate":float} ($LEDGER)
         self.order_status = {}; self.acctdone = False; self.posdone = False
+        self.sumdone = False                   # $LEDGER account-summary download complete
         self.conn_lost = False                 # set on a hard connectivity-loss code
     def nextValidId(self, oid): self._next = oid; self._idev.set()
     def next_order_id(self):
@@ -102,8 +132,17 @@ class App(EWrapper, EClient):
         if k == "NetLiquidation" and cur in ("USD", "BASE"):
             self.nlv = float(v)
     def accountDownloadEnd(self, a): self.acctdone = True
-    # held positions via reqPositions (reliable for FX; portfolio/marketValue is not
-    # populated for FX on a closed-market weekend, which silently zeroed reconciliation)
+    # held FX via the per-currency cash ledger ($LEDGER:ALL). reqPositions() does NOT
+    # return IDEALPRO spot-FX conversions in this account (verified 2026-08-31), so the
+    # ledger is the reliable source; position() below is kept only as a cross-check log.
+    def accountSummary(self, reqId, account, tag, value, currency):
+        try: v = float(value)
+        except (TypeError, ValueError): return
+        if tag == "$LEDGER-CashBalance":
+            self.ledger.setdefault(currency, {})["cash"] = v
+        elif tag == "$LEDGER-ExchangeRate":
+            self.ledger.setdefault(currency, {})["rate"] = v
+    def accountSummaryEnd(self, reqId): self.sumdone = True
     def position(self, acct, c, position, avgCost):
         if c.secType == "CASH" and position != 0:
             self.raw_fx.append((c.symbol, c.currency, float(position)))
@@ -120,13 +159,21 @@ def main():
     try:
         app.reqAccountUpdates(True, "")
         app.reqPositions()
+        app.reqAccountSummary(9101, "All", "$LEDGER:ALL")
         t = time.time()
-        while (not app.acctdone or not app.posdone) and time.time() - t < 20:
+        while (not app.acctdone or not app.posdone or not app.sumdone) and time.time() - t < 20:
             time.sleep(0.3)
         time.sleep(1)
         nav = app.nlv or 0.0
         if nav <= 0:
             log("ABORT: could not read NAV."); return
+        # The FX cash ledger is how we know what's already held. If it didn't
+        # download, treating "unseen" as "flat" is exactly what doubled the sleeve
+        # before — so refuse to trade rather than risk re-stacking.
+        if not app.sumdone or not app.ledger:
+            log("ABORT: FX cash ledger ($LEDGER) unavailable this run; refusing to "
+                "trade (reconciling against an unknown position risks stacking).")
+            return
         # A stale-but-positive NAV can survive a broken gateway (this happened
         # 2026-08-24: NAV read $49,970 yet 0/6 legs acknowledged). Refuse to
         # transmit into a down socket regardless of what NAV came back.
@@ -147,7 +194,10 @@ def main():
 
         target = pl.fx_sleeve_targets(carry_row, nav, n_long=N_LONG, n_short=N_SHORT)
         log(f"FX book: {N_LONG} long / {N_SHORT} short legs")
-        current = held_to_signed(app.raw_fx, spot_row)
+        current = ledger_to_signed(app.ledger, min_usd=50.0)     # from the cash ledger
+        if app.raw_fx:                                           # reqPositions cross-check
+            log(f"note: reqPositions also reported CASH legs {app.raw_fx} "
+                "(normally empty for IDEALPRO spot-FX; ledger is authoritative)")
         delta = reconcile_delta(target, current, min_usd=50.0)   # no-churn band
 
         gross = sum(abs(v) for v in target.values())
@@ -178,6 +228,8 @@ def main():
             log("WARNING: not all FX legs filled — GTC legs keep working; "
                 "verify positions next session (sleeve stays under target until then).")
     finally:
+        try: app.cancelAccountSummary(9101)
+        except Exception: pass
         try: app.disconnect()
         except Exception: pass
 

@@ -36,6 +36,7 @@ class Snap(EWrapper, EClient):
     def __init__(self):
         EClient.__init__(self, self)
         self.v = {}; self.stk = {}; self.fx = []; self.acctdone=False; self.posdone=False
+        self.ledger = {}; self.sumdone=False   # per-ccy cash ledger ($LEDGER) -> FX sleeve
         self.acct=None; self._acctev=threading.Event()
         # daily / unrealized / realized from reqPnL (authoritative, real-time)
         self.pnl_daily=None; self.pnl_unreal=None; self.pnl_real=None
@@ -66,6 +67,16 @@ class Snap(EWrapper, EClient):
         if c.secType=="CASH" and pos!=0:
             self.fx.append((c.symbol, c.currency, float(pos)))
     def positionEnd(self): self.posdone=True
+    # FX sleeve comes from the per-currency cash ledger, NOT reqPositions (which does
+    # not surface IDEALPRO spot-FX conversions — it silently read the sleeve as $0).
+    def accountSummary(self, reqId, account, tag, value, currency):
+        try: val = float(value)
+        except (TypeError, ValueError): return
+        if tag == "$LEDGER-CashBalance":
+            self.ledger.setdefault(currency, {})["cash"] = val
+        elif tag == "$LEDGER-ExchangeRate":
+            self.ledger.setdefault(currency, {})["rate"] = val
+    def accountSummaryEnd(self, reqId): self.sumdone=True
 
 
 def gather():
@@ -73,13 +84,16 @@ def gather():
     threading.Thread(target=app.run, daemon=True).start()
     app._acctev.wait(6)                       # account code arrives on connect
     app.reqAccountUpdates(True, ""); app.reqPositions()
+    app.reqAccountSummary(7020, "All", "$LEDGER:ALL")   # per-ccy cash -> FX sleeve
     if app.acct:
         app.reqPnL(7010, app.acct, "")        # daily + unrealized + realized P&L
     t=time.time()
-    while (not app.acctdone or not app.posdone or app.pnl_daily is None) \
+    while (not app.acctdone or not app.posdone or not app.sumdone or app.pnl_daily is None) \
             and time.time()-t<20: time.sleep(0.3)
     time.sleep(1)
     try: app.cancelPnL(7010)
+    except Exception: pass
+    try: app.cancelAccountSummary(7020)
     except Exception: pass
     app.disconnect()
     return app
@@ -104,12 +118,17 @@ def build(app):
     eq = {s:d for s,d in app.stk.items() if s not in BONDS}
     bd = {s:d for s,d in app.stk.items() if s in BONDS}
     eq_v = sum(d["mv"] for d in eq.values()); bd_v = sum(d["mv"] for d in bd.values())
-    # FX carry legs -> readable long/short per ccy
+    # FX carry legs from the per-ccy cash ledger (USD value = CashBalance × rate,
+    # + = long foreign). USD/BASE are residual base cash, not FX legs. reqPositions
+    # does NOT surface IDEALPRO spot-FX, which is why this used to read $0.
     fx_legs = []
-    for sym,cur,pos in app.fx:
-        if sym=="USD": ccy, side = cur, ("SHORT" if pos>0 else "LONG"); notional=abs(pos)
-        else: ccy, side = sym, ("LONG" if pos>0 else "SHORT"); notional=abs(pos)
-        fx_legs.append((ccy, side, notional))
+    for ccy, led in app.ledger.items():
+        if ccy in ("USD", "BASE"): continue
+        cash, rate = led.get("cash"), led.get("rate")
+        if cash is None or rate is None: continue
+        usd = cash * rate
+        if abs(usd) < 50: continue                       # skip accrual dust
+        fx_legs.append((ccy, "LONG" if usd > 0 else "SHORT", abs(usd)))
     fx_gross = sum(n for _,_,n in fx_legs)
     pct = lambda x: (x/nav*100) if nav else 0
     ts = pd.Timestamp.now(tz="America/New_York").strftime("%a %b %d, %Y %-I:%M %p ET")

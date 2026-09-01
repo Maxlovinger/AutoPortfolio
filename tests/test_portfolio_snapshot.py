@@ -10,12 +10,13 @@ import types
 import portfolio_snapshot as ps
 
 
-def _app(v=None, stk=None, fx=None, daily=None, unreal=None):
+def _app(v=None, stk=None, fx=None, ledger=None, daily=None, unreal=None):
     a = types.SimpleNamespace()
     a.v = v or {"NetLiquidation": 248_000.0, "TotalCashValue": 73_000.0}
     a.stk = stk or {"AAPL": {"pos": 16, "mv": 3800.0, "upnl": -120.0},
                     "IEF": {"pos": 254, "mv": 24000.0, "upnl": -50.0}}
     a.fx = fx or []
+    a.ledger = ledger or {}
     a.pnl_daily = daily
     a.pnl_unreal = unreal
     a.pnl_real = 0.0
@@ -71,3 +72,26 @@ def test_build_daily_na_when_unavailable():
     assert "n/a" in html and "Day n/a" in subj
     # unrealized still renders from the fallback
     assert "1,743" in html
+
+
+# ------------------------------------------------------------------ FX sleeve
+def test_fx_sleeve_read_from_ledger_not_positions():
+    """Regression: FX read from reqPositions showed $0. It must come from the cash
+    ledger — short CHF (~-$64.6k) + long ZAR (~+$64.7k), gross ~$129k."""
+    a = _app(ledger={"CHF": {"cash": -52289.92, "rate": 1.2352072},
+                     "ZAR": {"cash": 1042157.82, "rate": 0.0620553},
+                     "USD": {"cash": 64604.0, "rate": 1.0},
+                     "BASE": {"cash": 64687.0, "rate": 1.0},
+                     "JPY": {"cash": 0.0, "rate": 0.0062}},   # dust -> excluded
+             daily=-10.0, unreal=-1853.0)
+    subj, html, text = ps.build(a)
+    assert "FX gross $129," in text            # ~$129k gross, not $0
+    assert "CHF" in html and "ZAR" in html     # both legs listed
+    assert "USD" not in text.split("FX:")[1]   # base cash isn't an FX leg
+    assert "JPY" not in html                    # dust filtered
+
+
+def test_fx_sleeve_zero_when_flat():
+    a = _app(ledger={"USD": {"cash": 100000.0, "rate": 1.0}}, daily=0.0, unreal=0.0)
+    _, _, text = ps.build(a)
+    assert "FX gross $0" in text
