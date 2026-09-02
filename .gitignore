@@ -28,3 +28,4 @@ entx_*_seen.json
 # universe.csv
 # universe_candidates.csv
 # universe_tickers.txt
+.coverage

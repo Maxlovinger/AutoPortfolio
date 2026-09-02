@@ -4,7 +4,9 @@ Entera Bio). Fetches ticker-tagged headlines from Alpha Vantage's NEWS_SENTIMENT
 feed, keeps only articles it hasn't sent before (dedupe state file), scores each
 one two ways — Alpha Vantage's own per-ticker sentiment AND this repo's
 news_sentiment scorer (FinBERT -> VADER -> bag-of-words) — and emails a compact
-digest. If nothing is new, it sends nothing and exits 0.
+digest that also carries the current stock price/day change. By default it
+reports EVERY ENTX-tagged article (no relevance floor). If nothing is new, it
+sends nothing and exits 0.
 
 Deliberately isolated from the trading system:
   * NO IBKR connection — it can't touch the Gateway session or the live book.
@@ -21,7 +23,8 @@ Usage:
     --send     email the digest via SMTP (only if there are new articles)
     --all      ignore the seen-state and show the most recent articles (test /
                first look); does NOT mark them seen unless combined with --send
-    --min-rel  drop articles whose ticker relevance is below this (default 0.10)
+    --min-rel  drop articles whose ticker relevance is below this (default 0.0 =
+               keep everything; raise it to trim low-relevance mentions)
 """
 from __future__ import annotations
 import json
@@ -40,7 +43,9 @@ import pandas as pd
 HERE = Path(__file__).resolve().parent
 AV_URL = "https://www.alphavantage.co/query"
 SEEN_KEEP = 800                      # cap the dedupe file so it can't grow forever
-DEFAULT_MIN_REL = 0.10               # ticker relevance floor (AV relevance in [0,1])
+DEFAULT_MIN_REL = 0.0                # 0 = report EVERY ENTX-tagged article (no floor);
+                                     # relevance is still shown per article, just not used
+                                     # to exclude. Raise via --min-rel to cut low-rel noise.
 
 
 # --------------------------------------------------------------------- env
@@ -79,6 +84,30 @@ def fetch_feed(ticker: str, limit: int = 50) -> list[dict]:
         note = data.get("Information") or data.get("Note") or data.get("Error Message") or data
         raise RuntimeError(f"Alpha Vantage returned no feed: {note}")
     return data["feed"]
+
+
+def fetch_quote(ticker: str) -> dict | None:
+    """Latest price + daily change for `ticker` via AV GLOBAL_QUOTE. Best-effort:
+    returns None on any failure so a quote hiccup never blocks the news digest.
+    Called only on runs that have new articles ('price when there is news')."""
+    key = os.getenv("ALPHA_VANTAGE_API")
+    if not key:
+        return None
+    q = urllib.parse.urlencode({"function": "GLOBAL_QUOTE", "symbol": ticker, "apikey": key})
+    try:
+        with urllib.request.urlopen(f"{AV_URL}?{q}", timeout=20) as r:
+            g = json.load(r).get("Global Quote") or {}
+        if not g.get("05. price"):
+            return None
+        return {
+            "price": float(g["05. price"]),
+            "change": float(g.get("09. change", "nan")),
+            "change_pct": float((g.get("10. change percent", "0") or "0").rstrip("%")),
+            "prev_close": float(g.get("08. previous close", "nan")),
+            "day": g.get("07. latest trading day", ""),
+        }
+    except Exception:
+        return None
 
 
 # ----------------------------------------------------------------- pure core
@@ -170,8 +199,26 @@ def _label(x: float) -> str:
 
 
 # ------------------------------------------------------------------ render
-def build_digest(ticker: str, new: list[dict], fb_scores: list, backend: str):
-    """(subject, html, text) for the new-article digest. Assumes new is non-empty."""
+def _price_bits(quote: dict | None):
+    """(html, text) fragments for the price line, or ('','') if no quote."""
+    if not quote:
+        return "", ""
+    ch, pct = quote.get("change"), quote.get("change_pct", 0.0)
+    up = (ch or 0) >= 0
+    color = "#137333" if up else "#a50e0e"
+    arrow = "▲" if up else "▼"
+    day = f" · {quote['day']}" if quote.get("day") else ""
+    html = (f'<div style="font-size:15px;margin-bottom:10px">'
+            f'Price <b>${quote["price"]:,.2f}</b> '
+            f'<span style="color:{color}">{arrow} {ch:+.2f} ({pct:+.2f}%)</span>'
+            f'<span style="color:#999;font-size:12px">{day}</span></div>')
+    text = f"Price ${quote['price']:,.2f} {arrow} {ch:+.2f} ({pct:+.2f}%){day}\n"
+    return html, text
+
+
+def build_digest(ticker: str, new: list[dict], fb_scores: list, backend: str, quote=None):
+    """(subject, html, text) for the new-article digest. Assumes new is non-empty.
+    `quote` (from fetch_quote) adds a price line when available."""
     n = len(new)
     rel_sum = sum(a["relevance"] for a in new) or 1.0
     av_net = sum(a["av_sent"] * a["relevance"] for a in new) / rel_sum   # rel-weighted
@@ -205,9 +252,11 @@ def build_digest(ticker: str, new: list[dict], fb_scores: list, backend: str):
                          f"{backend} {fb_txt}\n    {a['url']}")
 
     fb_net_txt = f"{fb_net:+.2f}" if fb_net is not None else "n/a"
+    price_html, price_text = _price_bits(quote)
     html = f"""<div style="font-family:-apple-system,Segoe UI,Roboto,sans-serif;max-width:620px;margin:auto">
 <h2 style="margin:0 0 2px">{ticker} — {n} new article{'s' if n!=1 else ''}</h2>
 <div style="color:#666;font-size:13px;margin-bottom:12px">{ts}</div>
+{price_html}
 <div style="font-size:14px;margin-bottom:12px">
   Net sentiment (relevance-weighted): AlphaVantage <b style="color:{col(av_net)}">{av_net:+.2f}</b>
   · {backend} <b style="color:{col(fb_net)}">{fb_net_txt}</b></div>
@@ -222,9 +271,11 @@ def build_digest(ticker: str, new: list[dict], fb_scores: list, backend: str):
 </div>"""
 
     text = (f"{ticker} — {n} new article{'s' if n!=1 else ''} — {ts}\n"
-            f"Net sentiment (rel-weighted): AV {av_net:+.2f} · {backend} {fb_net_txt}\n\n"
+            + price_text
+            + f"Net sentiment (rel-weighted): AV {av_net:+.2f} · {backend} {fb_net_txt}\n\n"
             + "\n".join(txt_lines) + "\n")
-    subj = f"{ticker} news: {n} new · AV {av_net:+.2f} · {backend} {fb_net_txt}"
+    px = f" · ${quote['price']:,.2f} ({quote['change_pct']:+.1f}%)" if quote else ""
+    subj = f"{ticker} news: {n} new{px} · AV {av_net:+.2f} · {backend} {fb_net_txt}"
     return subj, html, text
 
 
@@ -281,7 +332,8 @@ def main():
         return
 
     fb_scores, backend = score_finbert(new)
-    subj, html, text = build_digest(ticker, new, fb_scores, backend)
+    quote = fetch_quote(ticker)                 # price only when there IS news
+    subj, html, text = build_digest(ticker, new, fb_scores, backend, quote=quote)
 
     if send:
         if send_email(subj, html, text):
@@ -296,5 +348,5 @@ def main():
         print("(dry-run — nothing emailed, seen-state unchanged; use --send)")
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover
     main()

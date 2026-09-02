@@ -49,3 +49,15 @@ scp deploy/*.sh deploy/gateway_health.py entx_news.py pi:/home/maxlovinger/autoP
 ssh pi 'chmod +x /home/maxlovinger/autoPortfolio/*.sh'
 ```
 Then add the ENTX cron line above via `ssh pi 'crontab -e'`.
+
+### ENTX reporter's isolated venv (`.venv-news`)
+The news reporter runs under its **own** virtualenv, never the trading `.venv`,
+because it needs torch + transformers (FinBERT) — which must not sit in the live
+trading environment. Note the **CPU-only** torch index: the default `pip install
+torch` pulls the CUDA build, whose CUDA-preload segfaults on the Pi's ARM.
+```
+cd /home/maxlovinger/autoPortfolio
+python3 -m venv .venv-news && source .venv-news/bin/activate
+pip install torch --index-url https://download.pytorch.org/whl/cpu
+pip install transformers pandas
+```
