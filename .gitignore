@@ -15,6 +15,8 @@ decision_log.jsonl
 auto_run.log
 launchd.out.log
 launchd.err.log
+entx_news.log
+entx_*_seen.json
 
 # Secrets
 .env

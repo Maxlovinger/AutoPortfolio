@@ -18,6 +18,7 @@ the Python code; this folder is the version-controlled source of truth.
 | `gateway_health.py` | Read-only probe: exit 0 if NAV readable, else 1. |
 | `gateway_health.sh` | Intraday auto-heal / warm-up cron wrapper around the probe. |
 | `run_snapshot_pi.sh` | Daily NAV snapshot email. |
+| `run_entx_news_pi.sh` | ENTX (Entera Bio) news reporter. **No IBKR connection** — fully isolated from the trading system; emails only when a new article appears. |
 
 ## Safety model (two independent layers)
 1. **Operational** — `ensure_gateway.sh` confirms the gateway is logged in
@@ -34,11 +35,17 @@ the Python code; this folder is the version-controlled source of truth.
 5 17 * * *     /home/maxlovinger/autoPortfolio/run_snapshot_pi.sh # daily snapshot email
 45 9 * * 1-5   /home/maxlovinger/autoPortfolio/gateway_health.sh  # warm-up
 0 13 * * 1-5   /home/maxlovinger/autoPortfolio/gateway_health.sh  # intraday heal
+0 9-16 * * 1-5 /home/maxlovinger/autoPortfolio/run_entx_news_pi.sh # ENTX news (hourly, market hrs; emails only if new)
 ```
+> ENTX news cron: hourly on the top of the hour, 9am–4pm **pi local time**,
+> weekdays. Confirm the pi's timezone (`timedatectl`) — if it's UTC not ET, shift
+> the hours to cover the 09:30–16:00 ET session. The job is a safe no-op when
+> there's nothing new, so a slightly wide window is harmless.
 
 ## Deploy
 Copy changed files to the pi, then re-check perms:
 ```
-scp deploy/*.sh deploy/gateway_health.py pi:/home/maxlovinger/autoPortfolio/
+scp deploy/*.sh deploy/gateway_health.py entx_news.py pi:/home/maxlovinger/autoPortfolio/
 ssh pi 'chmod +x /home/maxlovinger/autoPortfolio/*.sh'
 ```
+Then add the ENTX cron line above via `ssh pi 'crontab -e'`.
