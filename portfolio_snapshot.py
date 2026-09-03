@@ -79,7 +79,7 @@ class Snap(EWrapper, EClient):
     def accountSummaryEnd(self, reqId): self.sumdone=True
 
 
-def gather():
+def _gather_once():
     app = Snap(); app.connect("127.0.0.1", PORT, clientId=19)
     threading.Thread(target=app.run, daemon=True).start()
     app._acctev.wait(6)                       # account code arrives on connect
@@ -96,6 +96,29 @@ def gather():
     try: app.cancelAccountSummary(7020)
     except Exception: pass
     app.disconnect()
+    return app
+
+
+def account_unavailable(app) -> bool:
+    """True when the Gateway returned no usable account data (NAV<=0). The snapshot
+    is READ-ONLY, so this is a connectivity/read failure — NOT a real $0 book. We
+    refuse to email a misleading all-zeros report when this is true (the Sep-2 bug)."""
+    try:
+        return (app.v.get("NetLiquidation", 0.0) or 0.0) <= 0
+    except Exception:
+        return True
+
+
+def gather(retries=2):
+    """Read the account, retrying a few times if the Gateway comes back empty
+    (NAV<=0). A single transient read failure produced the misleading all-$0
+    snapshot on Sep 2; a fresh reconnect usually clears it."""
+    app = _gather_once()
+    attempt = 1
+    while account_unavailable(app) and attempt <= retries:
+        time.sleep(3)                          # let a flapping gateway settle
+        app = _gather_once()
+        attempt += 1
     return app
 
 
@@ -181,6 +204,33 @@ def build(app):
     return subj, html, text
 
 
+def build_unavailable():
+    """Alert email for when the snapshot couldn't read the account (Gateway down /
+    not serving data). Clearly labeled so a read failure never masquerades as a real
+    $0 portfolio — this replaces the misleading all-zeros report."""
+    now = pd.Timestamp.now(tz="America/New_York")
+    ts = now.strftime("%a %b %d, %Y %-I:%M %p ET")
+    subj = f"⚠️ Portfolio snapshot unavailable — Gateway returned no data | {now.strftime('%b %d')}"
+    html = f"""<div style="font-family:-apple-system,Segoe UI,Roboto,sans-serif;max-width:520px;margin:auto">
+<h2 style="margin:0 0 2px">⚠️ Portfolio snapshot unavailable</h2>
+<div style="color:#666;font-size:13px;margin-bottom:14px">{ts}</div>
+<div style="font-size:15px;line-height:1.6">
+The Gateway returned <b>no account data</b> (NAV read as $0) after retries, so there
+is nothing to report this run.<br><br>
+This is a <b>connectivity/read issue, not a real $0 balance</b> — the snapshot is
+read-only and never changes positions, and the trading jobs abort on NAV&le;0. Your
+book is unaffected; the next scheduled snapshot should read normally once the Gateway
+is serving data again.</div>
+<div style="color:#999;font-size:11px;margin-top:16px">Sent instead of a misleading all-zeros report.</div>
+</div>"""
+    text = (f"Portfolio snapshot unavailable — {ts}\n"
+            "The Gateway returned no account data (NAV $0) after retries. This is a "
+            "connectivity/read issue, NOT a real $0 balance: the snapshot is read-only "
+            "and the trading jobs abort on NAV<=0. The book is unaffected; the next "
+            "snapshot should read normally once the Gateway is serving data again.\n")
+    return subj, html, text
+
+
 def send_email(subj, html, text):
     host=os.getenv("SMTP_HOST"); port=int(os.getenv("SMTP_PORT","465"))
     user=os.getenv("SMTP_USER"); pw=os.getenv("SMTP_PASS"); to=os.getenv("SNAPSHOT_TO", user)
@@ -204,7 +254,11 @@ def main():
             if line and not line.startswith("#") and "=" in line:
                 k,v=line.split("=",1); os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
     app = gather()
-    subj, html, text = build(app)
+    # A read failure (NAV<=0) must NOT go out as a real-looking all-$0 report.
+    if account_unavailable(app):
+        subj, html, text = build_unavailable()
+    else:
+        subj, html, text = build(app)
     if "--send" in sys.argv:
         send_email(subj, html, text)
     else:

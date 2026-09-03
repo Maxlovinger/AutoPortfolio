@@ -95,3 +95,34 @@ def test_fx_sleeve_zero_when_flat():
     a = _app(ledger={"USD": {"cash": 100000.0, "rate": 1.0}}, daily=0.0, unreal=0.0)
     _, _, text = ps.build(a)
     assert "FX gross $0" in text
+
+
+# ---------------------------------------------- gateway-unavailable guard
+def test_account_unavailable_true_when_nav_zero():
+    # the Sep-2 bug: Gateway returned no data -> NAV 0. Must be flagged unavailable.
+    a = _app(v={"NetLiquidation": 0.0, "TotalCashValue": 0.0})
+    assert ps.account_unavailable(a) is True
+
+
+def test_account_unavailable_true_when_nav_missing():
+    a = _app(v={"TotalCashValue": 0.0})           # no NetLiquidation key at all
+    assert ps.account_unavailable(a) is True
+
+
+def test_account_unavailable_false_with_real_nav():
+    assert ps.account_unavailable(_app()) is False   # default NAV 248,000
+
+
+def test_build_unavailable_is_clearly_labeled():
+    subj, html, text = ps.build_unavailable()
+    assert "unavailable" in subj.lower()
+    # must NOT look like a real $0 report — explains it's connectivity, not balance
+    for surface in (html, text):
+        assert "not a real $0" in surface.lower()
+        assert "read-only" in surface.lower()
+
+
+def test_build_unavailable_does_not_fabricate_numbers():
+    # no "$248" style figures — nothing to report; avoids the misleading-zeros trap
+    _, _, text = ps.build_unavailable()
+    assert "0.0%" not in text and "Net Liquidation" not in text
